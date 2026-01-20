@@ -32,6 +32,9 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "45"))
 PORT = int(os.getenv("PORT", "8080"))
 BASE_DIR = Path(__file__).resolve().parent
 
+# Проксі (опціонально) - формат: http://user:pass@host:port
+PROXY_URL = os.getenv("PROXY_URL", "")
+
 APQE_PQFRTY = os.getenv("APQE_PQFRTY")
 APSRC_PFRTY = os.getenv("APSRC_PFRTY")
 
@@ -212,11 +215,20 @@ def _fetch_with_cloudscraper(url: str, params: dict = None, method: str = "GET",
         }
     )
     
+    # Налаштування проксі
+    proxies = None
+    if PROXY_URL:
+        proxies = {
+            'http': PROXY_URL,
+            'https': PROXY_URL
+        }
+        logging.debug(f"Using proxy: {PROXY_URL[:30]}...")
+    
     try:
         if method == "GET":
-            response = scraper.get(url, params=params, timeout=30)
+            response = scraper.get(url, params=params, timeout=30, proxies=proxies)
         else:
-            response = scraper.post(url, data=data, timeout=30)
+            response = scraper.post(url, data=data, timeout=30, proxies=proxies)
         
         if response.status_code == 200:
             return response.json()
@@ -767,6 +779,7 @@ async def main():
     logging.info("🤖 Bot starting...")
     logging.info(f"📋 Config: APQE_PQFRTY={'SET' if APQE_PQFRTY else 'NOT SET'}, APSRC_PFRTY={'SET' if APSRC_PFRTY else 'NOT SET'}")
     logging.info(f"📋 MongoDB: {MONGO_URI[:20]}...")
+    logging.info(f"📋 Proxy: {'SET - ' + PROXY_URL[:30] + '...' if PROXY_URL else 'NOT SET (direct connection)'}")
     await init_db()
     
     try:
