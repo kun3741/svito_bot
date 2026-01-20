@@ -62,9 +62,25 @@ db = None
 async def init_db():
     """Ініціалізація підключення до MongoDB"""
     global mongo_client, db
-    mongo_client = AsyncIOMotorClient(MONGO_URI)
-    db = mongo_client[DB_NAME]
-    logging.info("✅ Connected to MongoDB")
+    try:
+        mongo_client = AsyncIOMotorClient(MONGO_URI)
+        db = mongo_client[DB_NAME]
+        
+        # Перевірка з'єднання
+        await mongo_client.admin.command('ping')
+        
+        # Перевірка колекцій
+        collections = await db.list_collection_names()
+        logging.info(f"✅ Connected to MongoDB. Collections: {collections}")
+        
+        # Рахуємо документи
+        users_count = await db.users.count_documents({})
+        states_count = await db.schedule_state.count_documents({})
+        logging.info(f"📊 Users: {users_count}, Schedule states: {states_count}")
+        
+    except Exception as e:
+        logging.error(f"❌ MongoDB connection failed: {e}")
+        raise
 
 async def close_db():
     """Закриття підключення до MongoDB"""
@@ -113,18 +129,25 @@ async def get_users_by_queue(queue: str) -> list[int]:
 
 async def get_schedule_state(queue_id: str) -> str | None:
     """Отримує збережений стан графіку для черги"""
-    state = await db.schedule_state.find_one({"queue_id": queue_id})
-    if state:
-        return state.get("data_hash")
-    return None
+    try:
+        state = await db.schedule_state.find_one({"queue_id": queue_id})
+        if state:
+            return state.get("data_hash")
+        return None
+    except Exception as e:
+        logging.error(f"Error getting schedule state for {queue_id}: {e}")
+        return None
 
 async def save_schedule_state(queue_id: str, data_hash: str):
     """Зберігає стан графіку для черги"""
-    await db.schedule_state.update_one(
-        {"queue_id": queue_id},
-        {"$set": {"data_hash": data_hash, "updated_at": datetime.now()}},
-        upsert=True
-    )
+    try:
+        await db.schedule_state.update_one(
+            {"queue_id": queue_id},
+            {"$set": {"data_hash": data_hash, "updated_at": datetime.now()}},
+            upsert=True
+        )
+    except Exception as e:
+        logging.error(f"Error saving schedule state for {queue_id}: {e}")
 
 # --- КЛАВІАТУРИ ---
 def get_main_keyboard(has_queue: bool = False) -> ReplyKeyboardMarkup:
