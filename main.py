@@ -4,6 +4,7 @@ import json
 import ssl
 import os
 from datetime import datetime
+from pathlib import Path
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -16,6 +17,7 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 import aiohttp
+from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- КОНФІГУРАЦІЯ ---
@@ -25,6 +27,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = os.getenv("DB_NAME", "lumos_bot")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "45"))
+PORT = int(os.getenv("PORT", "8080"))
+BASE_DIR = Path(__file__).resolve().parent
 
 APQE_PQFRTY = os.getenv("APQE_PQFRTY")
 APSRC_PFRTY = os.getenv("APSRC_PFRTY")
@@ -658,12 +662,64 @@ async def scheduled_checker():
             logging.info(f"Check completed. Next check in {CHECK_INTERVAL} seconds")
             await asyncio.sleep(CHECK_INTERVAL)
 
+# --- ВЕБ-СЕРВЕР ---
+async def get_users_count() -> int:
+    """Повертає кількість користувачів"""
+    try:
+        count = await db.users.count_documents({})
+        return count
+    except:
+        return 0
+
+async def handle_index(request):
+    """Головна сторінка"""
+    template_path = BASE_DIR / "templates" / "index.html"
+    
+    try:
+        with open(template_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        
+        users_count = await get_users_count()
+        html = html.replace("{{users_count}}", str(users_count))
+        html = html.replace("{{check_interval}}", str(CHECK_INTERVAL))
+        
+        return web.Response(text=html, content_type="text/html")
+    except Exception as e:
+        logging.error(f"Error loading template: {e}")
+        return web.Response(text="Lumos Bot is running!", content_type="text/plain")
+
+async def handle_health(request):
+    """Health check для Render"""
+    return web.json_response({
+        "status": "ok",
+        "service": "lumos-bot",
+        "timestamp": datetime.now().isoformat()
+    })
+
+async def start_web_server():
+    """Запуск веб-сервера"""
+    app = web.Application()
+    app.router.add_get("/", handle_index)
+    app.router.add_get("/health", handle_health)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logging.info(f"🌐 Web server started on port {PORT}")
+
 async def main():
     logging.info("🤖 Bot starting...")
     await init_db()
     
     try:
+        # Запускаємо веб-сервер
+        await start_web_server()
+        
+        # Запускаємо моніторинг графіків
         asyncio.create_task(scheduled_checker())
+        
+        # Запускаємо бота
         await dp.start_polling(bot)
     finally:
         await close_db()

@@ -29,5 +29,5 @@ Thumbs.db
 *.log
 
 # Old data files (migrated to MongoDB)
-*.json
-!package.json
+schedule_state.json
+users_data.json
