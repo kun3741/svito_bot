@@ -19,6 +19,8 @@ from aiogram.fsm.state import State, StatesGroup
 import aiohttp
 from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
+import cloudscraper
+from concurrent.futures import ThreadPoolExecutor
 
 # --- КОНФІГУРАЦІЯ ---
 load_dotenv()
@@ -197,21 +199,50 @@ def get_ssl_context():
     ssl_context.set_ciphers('DEFAULT@SECLEVEL=1')
     return ssl_context
 
+# Thread pool для синхронних запитів cloudscraper
+executor = ThreadPoolExecutor(max_workers=3)
+
+def _fetch_with_cloudscraper(url: str, params: dict = None, method: str = "GET", data: dict = None):
+    """Синхронний запит через cloudscraper (обхід Cloudflare)"""
+    scraper = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'desktop': True
+        }
+    )
+    
+    try:
+        if method == "GET":
+            response = scraper.get(url, params=params, timeout=30)
+        else:
+            response = scraper.post(url, data=data, timeout=30)
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            logging.error(f"Cloudscraper returned {response.status_code}: {response.text[:200]}")
+            return None
+    except Exception as e:
+        logging.error(f"Cloudscraper error: {e}")
+        return None
+
 async def fetch_schedule(session, queue_id):
     if not APQE_PQFRTY:
         logging.error("APQE_PQFRTY not set!")
         return None
     
-    params = {'queue': queue_id}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
     try:
-        async with session.get(APQE_PQFRTY, params=params, headers=headers) as response:
-            if response.status == 200:
-                return await response.json()
-            logging.error(f"API returned status {response.status} for queue {queue_id}")
-            return None
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            executor,
+            _fetch_with_cloudscraper,
+            APQE_PQFRTY,
+            {'queue': queue_id},
+            "GET",
+            None
+        )
+        return result
     except Exception as e:
         logging.error(f"Error fetching {queue_id}: {e}")
         return None
@@ -229,26 +260,21 @@ async def fetch_schedule_by_address(city: str, street: str, house: str) -> dict 
         'address': address
     }
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://svitlo.oe.if.ua/",
-        "Origin": "https://svitlo.oe.if.ua"
-    }
-    
-    ssl_context = get_ssl_context()
-    connector = aiohttp.TCPConnector(ssl=ssl_context)
-    
     try:
-        async with aiohttp.ClientSession(connector=connector) as session:
-            async with session.post(APSRC_PFRTY, data=payload, headers=headers) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    logging.info(f"Address search result for '{address}': {data}")
-                    return data
-                else:
-                    text = await response.text()
-                    logging.error(f"Address search failed: {response.status}, response: {text[:500]}")
-                    return None
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            executor,
+            _fetch_with_cloudscraper,
+            APSRC_PFRTY,
+            None,
+            "POST",
+            payload
+        )
+        
+        if result:
+            logging.info(f"Address search result for '{address}': {result}")
+        return result
+        
     except Exception as e:
         logging.error(f"Error searching by address: {e}")
         return None
@@ -332,7 +358,7 @@ def format_notification(queue_id, data, is_update=True, address=None):
     header = "⚡️ *Оновлення ГПВ!*" if is_update else "📊 *Поточний графік*"
     
     address_line = f"📍 *Адреса:* {address}\n" if address else ""
-    
+
     text = (
         f"{header}\n\n"
         f"{address_line}"
@@ -653,47 +679,43 @@ async def scheduled_checker():
     logging.info("🚀 Monitor started")
     await asyncio.sleep(10)
     
-    ssl_context = get_ssl_context()
-    connector = aiohttp.TCPConnector(ssl=ssl_context)
-    
-    async with aiohttp.ClientSession(connector=connector) as session:
-        while True:
-            for queue_id in QUEUES:
-                data = await fetch_schedule(session, queue_id)
-                if not data:
-                    continue
+    while True:
+        for queue_id in QUEUES:
+            data = await fetch_schedule(None, queue_id)
+            if not data:
+                continue
 
-                schedule_data = extract_schedule_hours(data, queue_id)
-                if not schedule_data:
-                    continue
-                
-                current_hash = json.dumps(schedule_data, sort_keys=True)
-                saved_hash = await get_schedule_state(queue_id)
-                
-                if saved_hash != current_hash:
-                    logging.info(f"Schedule changed for queue {queue_id}: {schedule_data}")
-                    
-                    subscribers = await get_users_by_queue(queue_id)
-                    
-                    if subscribers:
-                        for user_id in subscribers:
-                            try:
-                                user_data = await get_user_data(user_id)
-                                address = user_data.get("address") if isinstance(user_data, dict) else None
-                                msg = format_notification(queue_id, data, is_update=True, address=address)
-                                await bot.send_message(user_id, msg, parse_mode=ParseMode.MARKDOWN)
-                                logging.info(f"Notification sent to {user_id} for queue {queue_id}")
-                            except Exception as e:
-                                logging.error(f"Failed to send to {user_id}: {e}")
-                            
-                            await asyncio.sleep(0.5)
-                    
-                    await save_schedule_state(queue_id, current_hash)
-                
-                await asyncio.sleep(1)
+            schedule_data = extract_schedule_hours(data, queue_id)
+            if not schedule_data:
+                continue
             
-            logging.info(f"Check completed. Next check in {CHECK_INTERVAL} seconds")
-            await asyncio.sleep(CHECK_INTERVAL)
+            current_hash = json.dumps(schedule_data, sort_keys=True)
+            saved_hash = await get_schedule_state(queue_id)
+            
+            if saved_hash != current_hash:
+                logging.info(f"Schedule changed for queue {queue_id}: {schedule_data}")
+                
+                subscribers = await get_users_by_queue(queue_id)
+                
+                if subscribers:
+                    for user_id in subscribers:
+                        try:
+                            user_data = await get_user_data(user_id)
+                            address = user_data.get("address") if isinstance(user_data, dict) else None
+                            msg = format_notification(queue_id, data, is_update=True, address=address)
+                            await bot.send_message(user_id, msg, parse_mode=ParseMode.MARKDOWN)
+                            logging.info(f"Notification sent to {user_id} for queue {queue_id}")
+                        except Exception as e:
+                            logging.error(f"Failed to send to {user_id}: {e}")
+                        
+                        await asyncio.sleep(0.5)
+                
+                await save_schedule_state(queue_id, current_hash)
+            
+            await asyncio.sleep(1)
+        
+        logging.info(f"Check completed. Next check in {CHECK_INTERVAL} seconds")
+        await asyncio.sleep(CHECK_INTERVAL)
 
 # --- ВЕБ-СЕРВЕР ---
 async def get_users_count() -> int:
