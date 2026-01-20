@@ -175,6 +175,10 @@ def get_ssl_context():
     return ssl_context
 
 async def fetch_schedule(session, queue_id):
+    if not APQE_PQFRTY:
+        logging.error("APQE_PQFRTY not set!")
+        return None
+    
     params = {'queue': queue_id}
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -183,12 +187,17 @@ async def fetch_schedule(session, queue_id):
         async with session.get(APQE_PQFRTY, params=params, headers=headers) as response:
             if response.status == 200:
                 return await response.json()
+            logging.error(f"API returned status {response.status} for queue {queue_id}")
             return None
     except Exception as e:
         logging.error(f"Error fetching {queue_id}: {e}")
         return None
 
 async def fetch_schedule_by_address(city: str, street: str, house: str) -> dict | None:
+    if not APSRC_PFRTY:
+        logging.error("APSRC_PFRTY not set!")
+        return None
+    
     address = f"{city},{street},{house}"
     
     payload = {
@@ -214,7 +223,8 @@ async def fetch_schedule_by_address(city: str, street: str, house: str) -> dict 
                     logging.info(f"Address search result for '{address}': {data}")
                     return data
                 else:
-                    logging.error(f"Address search failed: {response.status}")
+                    text = await response.text()
+                    logging.error(f"Address search failed: {response.status}, response: {text[:500]}")
                     return None
     except Exception as e:
         logging.error(f"Error searching by address: {e}")
@@ -710,6 +720,8 @@ async def start_web_server():
 
 async def main():
     logging.info("🤖 Bot starting...")
+    logging.info(f"📋 Config: APQE_PQFRTY={'SET' if APQE_PQFRTY else 'NOT SET'}, APSRC_PFRTY={'SET' if APSRC_PFRTY else 'NOT SET'}")
+    logging.info(f"📋 MongoDB: {MONGO_URI[:20]}...")
     await init_db()
     
     try:
