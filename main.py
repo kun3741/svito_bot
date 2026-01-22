@@ -16,6 +16,8 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiohttp import web
+import aiohttp
+import aiohttp_socks
 from motor.motor_asyncio import AsyncIOMotorClient
 from curl_cffi.requests import AsyncSession
 
