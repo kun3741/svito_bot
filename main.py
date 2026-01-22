@@ -21,6 +21,7 @@ from aiohttp import web
 import aiohttp
 import aiohttp_socks
 from motor.motor_asyncio import AsyncIOMotorClient
+from curl_cffi.requests import AsyncSession
 
 # --- КОНФІГУРАЦІЯ ---
 load_dotenv()
@@ -368,25 +369,19 @@ async def fetch_schedule(session, queue_id):
         return None
     
     params = {'queue': queue_id}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-        "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",  # <-- ДОДАНО
-        "Referer": "https://svitlo.oe.if.ua/"
-    }
-    
-    ssl_context = get_ssl_context()
-    connector = aiohttp.TCPConnector(ssl=ssl_context)
+    # Видаляємо старі заголовки, curl_cffi сформує їх автоматично
     
     try:
-        async with aiohttp.ClientSession(connector=connector) as session:
-            async with session.get(APQE_PQFRTY, params=params, headers=headers, proxy=PROXY_URL) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    text = await response.text()
-                    logging.error(f"API returned {response.status} for queue {queue_id}: {text[:200]}")
-                    return None
+        # impersonate="chrome120" робить вигляд, що це браузер Chrome
+        # proxy=PROXY_URL передає твій socks5
+        async with AsyncSession(impersonate="chrome120", proxy=PROXY_URL) as session:
+            response = await session.get(APQE_PQFRTY, params=params)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logging.error(f"API returned {response.status_code} for queue {queue_id}")
+                return None
     except Exception as e:
         logging.error(f"Error fetching {queue_id}: {e}")
         return None
@@ -397,34 +392,23 @@ async def fetch_schedule_by_address(city: str, street: str, house: str) -> dict 
         return None
     
     address = f"{city},{street},{house}"
-    
     payload = {
         'accountNumber': '',
         'userSearchChoice': 'pob',
         'address': address
     }
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",  # <-- ДОДАНО
-        "Referer": "https://svitlo.oe.if.ua/",
-        "Origin": "https://svitlo.oe.if.ua"
-    }
-    
-    ssl_context = get_ssl_context()
-    connector = aiohttp.TCPConnector(ssl=ssl_context)
-    
     try:
-        async with aiohttp.ClientSession(connector=connector) as session:
-            async with session.post(APSRC_PFRTY, data=payload, headers=headers, proxy=PROXY_URL) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    logging.info(f"Address search result for '{address}': {data}")
-                    return data
-                else:
-                    text = await response.text()
-                    logging.error(f"Address search failed: {response.status}, response: {text[:200]}")
-                    return None
+        async with AsyncSession(impersonate="chrome120", proxy=PROXY_URL) as session:
+            response = await session.post(APSRC_PFRTY, data=payload)
+            
+            if response.status_code == 200:
+                data = response.json()
+                logging.info(f"Address search result for '{address}': {data}")
+                return data
+            else:
+                logging.error(f"Address search failed: {response.status_code}")
+                return None
     except Exception as e:
         logging.error(f"Error searching by address: {e}")
         return None
