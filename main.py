@@ -554,7 +554,7 @@ async def scheduled_checker():
     
     while True:
         try:
-            # Створюємо ОДНУ сесію на весь цикл перевірки всіх черг
+            # Створюємо ОДНУ сесію на весь цикл перевірки
             async with AsyncSession(impersonate="chrome120", proxy=PROXY_URL) as session:
                 for queue_id in QUEUES:
                     data = await fetch_schedule(session, queue_id)
@@ -562,29 +562,46 @@ async def scheduled_checker():
 
                     current_schedules = extract_all_schedules(data, queue_id)
                     saved_state_json = await get_schedule_state(queue_id)
-                    saved_schedules = json.loads(saved_state_json) if saved_state_json else {}
+                    
+                    # Завантажуємо старий стан
+                    saved_schedules = {}
+                    if saved_state_json:
+                        try:
+                            saved_schedules = json.loads(saved_state_json)
+                        except:
+                            saved_schedules = {}
                     
                     changes = []
+                    # Порівнюємо графіки
                     for date, hours in current_schedules.items():
                         current_hash = json.dumps(hours, sort_keys=True)
+                        
                         if date not in saved_schedules:
                             changes.append((date, hours, "new"))
-                        elif saved_schedules[date] != current_hash:
+                        elif saved_schedules.get(date) != current_hash:
                             changes.append((date, hours, "updated"))
+                        
+                        # Оновлюємо стан у пам'яті (щоб потім зберегти)
                         saved_schedules[date] = current_hash
                     
+                    # Якщо є зміни — розсилаємо
                     if changes:
                         subscribers = await get_users_by_queue(queue_id)
-                        for user_id in subscribers:
-                            for date, hours, c_type in changes:
-                                msg = f"📢 *{'Новий графік' if c_type=='new' else 'Зміна графіку'} на {date}*\nЧерга: {queue_id}"
-                                try:
-                                    await bot.send_message(user_id, msg, parse_mode=ParseMode.MARKDOWN)
-                                except: pass
-                                await asyncio.sleep(0.2)
+                        if subscribers:
+                            for user_id in subscribers:
+                                for date, hours, c_type in changes:
+                                    # ОСЬ ТУТ ТЕПЕР ВИКЛИК ПОВНОГО ФОРМАТУВАННЯ
+                                    msg = format_schedule_notification(queue_id, date, hours, c_type)
+                                    try:
+                                        await bot.send_message(user_id, msg, parse_mode=ParseMode.MARKDOWN)
+                                    except Exception as e:
+                                        logging.error(f"Send error {user_id}: {e}")
+                                    await asyncio.sleep(0.2)
+                        
+                        # Зберігаємо оновлений стан у базу
                         await save_schedule_state(queue_id, json.dumps(saved_schedules))
                     
-                    await asyncio.sleep(1) # Пауза між запитами
+                    await asyncio.sleep(1) # Пауза між чергами
         except Exception as e:
             logging.error(f"Checker loop error: {e}")
         
