@@ -33,6 +33,8 @@ BASE_DIR = Path(__file__).resolve().parent
 APQE_PQFRTY = os.getenv("APQE_PQFRTY")
 APSRC_PFRTY = os.getenv("APSRC_PFRTY")
 
+PROXY_URL = os.getenv("PROXY_URL")  # Наприклад: "http://user:pass@1.2.3.4:8080"
+
 # Список черг для моніторингу
 QUEUES = [
     "1.1", "1.2",
@@ -367,6 +369,7 @@ async def fetch_schedule(session, queue_id):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json",
+        "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",  # <-- ДОДАНО
         "Referer": "https://svitlo.oe.if.ua/"
     }
     
@@ -375,7 +378,7 @@ async def fetch_schedule(session, queue_id):
     
     try:
         async with aiohttp.ClientSession(connector=connector) as session:
-            async with session.get(APQE_PQFRTY, params=params, headers=headers) as response:
+            async with session.get(APQE_PQFRTY, params=params, headers=headers, proxy=PROXY_URL) as response:
                 if response.status == 200:
                     return await response.json()
                 else:
@@ -401,6 +404,7 @@ async def fetch_schedule_by_address(city: str, street: str, house: str) -> dict 
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",  # <-- ДОДАНО
         "Referer": "https://svitlo.oe.if.ua/",
         "Origin": "https://svitlo.oe.if.ua"
     }
@@ -410,7 +414,7 @@ async def fetch_schedule_by_address(city: str, street: str, house: str) -> dict 
     
     try:
         async with aiohttp.ClientSession(connector=connector) as session:
-            async with session.post(APSRC_PFRTY, data=payload, headers=headers) as response:
+            async with session.post(APSRC_PFRTY, data=payload, headers=headers, proxy=PROXY_URL) as response:
                 if response.status == 200:
                     data = await response.json()
                     logging.info(f"Address search result for '{address}': {data}")
