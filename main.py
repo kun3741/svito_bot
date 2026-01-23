@@ -569,6 +569,20 @@ async def cmd_start(message: Message, state: FSMContext):
     
     await message.answer(text, reply_markup=get_main_keyboard(has_queue), parse_mode=ParseMode.MARKDOWN)
 
+
+@dp.message(Command("time"))
+async def cmd_time(message: Message):
+    # Отримуємо час у зоні KYIV_TZ (яку ми визначили раніше)
+    now = datetime.now(KYIV_TZ)
+    
+    text = (
+        f"🕒 *Поточний час (Київ):*\n"
+        f"`{now.strftime('%H:%M:%S')}`\n\n"
+        f"📅 *Дата:* `{now.strftime('%d.%m.%Y')}`"
+    )
+    
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+    
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     text = (
