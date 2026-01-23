@@ -15,7 +15,8 @@ from aiogram.types import (
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.state import State, 
+from aiogram.exceptions import TelegramBadRequest
 import aiohttp
 from aiohttp import web
 import aiohttp
@@ -884,9 +885,7 @@ async def cb_done_select(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "toggle_reminders")
 async def cb_toggle_reminders(callback: CallbackQuery):
-    """Перемикає стан нагадувань"""
     new_state = await toggle_user_reminders(callback.from_user.id)
-    
     user_data = await get_user_data(callback.from_user.id)
     queues = user_data.get("queues", []) if user_data else []
     
@@ -896,7 +895,14 @@ async def cb_toggle_reminders(callback: CallbackQuery):
     else:
         text = "⚡ *Оберіть спосіб налаштування:*"
     
-    await callback.message.edit_text(text, reply_markup=get_queue_choice_keyboard(new_state), parse_mode=ParseMode.MARKDOWN)
+    try:
+        await callback.message.edit_text(text, reply_markup=get_queue_choice_keyboard(new_state), parse_mode=ParseMode.MARKDOWN)
+    except TelegramBadRequest as e:
+        # Ігноруємо помилку, якщо повідомлення не змінилося (наприклад, при подвійному кліку)
+        if "message is not modified" in str(e):
+            pass
+        else:
+            raise e
     
     state_text = "увімкнено" if new_state else "вимкнено"
     await callback.answer(f"🔔 Нагадування {state_text}!")
