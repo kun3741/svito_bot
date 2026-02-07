@@ -16,12 +16,14 @@ from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.exceptions import TelegramBadRequest
 import aiohttp
 from aiohttp import web
 import aiohttp
 import aiohttp_socks
 from motor.motor_asyncio import AsyncIOMotorClient
 from curl_cffi.requests import AsyncSession
+from zoneinfo import ZoneInfo
 
 # --- КОНФІГУРАЦІЯ ---
 load_dotenv()
@@ -37,6 +39,8 @@ APQE_PQFRTY = os.getenv("APQE_PQFRTY")
 APSRC_PFRTY = os.getenv("APSRC_PFRTY")
 
 PROXY_URL = os.getenv("PROXY_URL")
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 # Список черг для моніторингу
 QUEUES = [
@@ -116,7 +120,7 @@ async def get_user_data(user_id: int) -> dict | None:
         return {
             "queues": queues, 
             "address": user.get("address"),
-            "reminders": user.get("reminders", True),  # За замовчуванням увімкнено
+            "reminders": user.get("reminders", False),  # За замовчуванням увімкнено
             "reminder_intervals": user.get("reminder_intervals", DEFAULT_REMINDER_INTERVALS)
         }
     return None
@@ -125,7 +129,7 @@ async def set_user_data(user_id: int, queues: list[str], address: str = None):
     """Зберігає дані користувача в MongoDB"""
     await db.users.update_one(
         {"user_id": user_id},
-        {"$set": {"queues": queues, "address": address, "updated_at": datetime.now()}, "$unset": {"queue": ""}},
+        {"$set": {"queues": queues, "address": address, "updated_at": datetime.now(KYIV_TZ)}, "$unset": {"queue": ""}},
         upsert=True
     )
 
@@ -172,7 +176,7 @@ async def get_users_by_queue(queue: str) -> list[int]:
 async def toggle_user_reminders(user_id: int) -> bool:
     """Перемикає стан нагадувань користувача, повертає новий стан"""
     user = await db.users.find_one({"user_id": user_id})
-    current_state = user.get("reminders", True) if user else True
+    current_state = user.get("reminders", False) if user else False
     new_state = not current_state
     
     await db.users.update_one(
@@ -226,7 +230,7 @@ async def save_schedule_state(queue_id: str, data_hash: str):
     try:
         await db.schedule_state.update_one(
             {"queue_id": queue_id},
-            {"$set": {"data_hash": data_hash, "updated_at": datetime.now()}},
+            {"$set": {"data_hash": data_hash, "updated_at": datetime.now(KYIV_TZ)}},
             upsert=True
         )
     except Exception as e:
@@ -265,14 +269,14 @@ async def mark_reminder_sent(user_id: int, queue_id: str, event_time: str, event
             "event_type": event_type,
             "minutes": minutes
         },
-        {"$set": {"sent_at": datetime.now()}},
+        {"$set": {"sent_at": datetime.now(KYIV_TZ)}},
         upsert=True
     )
 
 async def cleanup_old_reminders():
     """Видаляє старі нагадування (старші 2 днів)"""
     try:
-        cutoff = datetime.now() - timedelta(days=2)
+        cutoff = datetime.now(KYIV_TZ) - timedelta(days=2)
         result = await db.reminders.delete_many({"sent_at": {"$lt": cutoff}})
         if result.deleted_count > 0:
             logging.info(f"Cleaned {result.deleted_count} old reminders")
@@ -574,6 +578,20 @@ async def cmd_start(message: Message, state: FSMContext):
     
     await message.answer(text, reply_markup=get_main_keyboard(has_queue), parse_mode=ParseMode.MARKDOWN)
 
+
+@dp.message(Command("time"))
+async def cmd_time(message: Message):
+    # Отримуємо час у зоні KYIV_TZ (яку ми визначили раніше)
+    now = datetime.now(KYIV_TZ)
+    
+    text = (
+        f"🕒 *Поточний час (Київ):*\n"
+        f"`{now.strftime('%H:%M:%S')}`\n\n"
+        f"📅 *Дата:* `{now.strftime('%d.%m.%Y')}`"
+    )
+    
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+    
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     text = (
@@ -890,9 +908,7 @@ async def cb_done_select(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "toggle_reminders")
 async def cb_toggle_reminders(callback: CallbackQuery):
-    """Перемикає стан нагадувань"""
     new_state = await toggle_user_reminders(callback.from_user.id)
-    
     user_data = await get_user_data(callback.from_user.id)
     queues = user_data.get("queues", []) if user_data else []
     
@@ -902,7 +918,14 @@ async def cb_toggle_reminders(callback: CallbackQuery):
     else:
         text = "⚡ *Оберіть спосіб налаштування:*"
     
-    await callback.message.edit_text(text, reply_markup=get_queue_choice_keyboard(new_state), parse_mode=ParseMode.MARKDOWN)
+    try:
+        await callback.message.edit_text(text, reply_markup=get_queue_choice_keyboard(new_state), parse_mode=ParseMode.MARKDOWN)
+    except TelegramBadRequest as e:
+        # Ігноруємо помилку, якщо повідомлення не змінилося (наприклад, при подвійному кліку)
+        if "message is not modified" in str(e):
+            pass
+        else:
+            raise e
     
     state_text = "увімкнено" if new_state else "вимкнено"
     await callback.answer(f"🔔 Нагадування {state_text}!")
@@ -1107,7 +1130,7 @@ async def scheduled_checker():
                     saved_schedules = {}
             
             # Очищення старих дат (до сьогодні)
-            today = datetime.now().date()
+            today = datetime.now(KYIV_TZ).date()
             old_dates = []
             for date_str in list(saved_schedules.keys()):
                 try:
@@ -1181,7 +1204,7 @@ async def reminder_checker():
     
     while True:
         try:
-            now = datetime.now()
+            now = datetime.now(KYIV_TZ)
             today_str = now.strftime("%d.%m.%Y")
             
             # Очищення старих нагадувань раз на добу (о 3:00)
@@ -1189,10 +1212,7 @@ async def reminder_checker():
                 await cleanup_old_reminders()
             
             # Отримуємо всіх користувачів з підписками та увімкненими нагадуваннями
-            cursor = db.users.find({
-                "queues": {"$exists": True, "$ne": []},
-                "$or": [{"reminders": True}, {"reminders": {"$exists": False}}]  # За замовчуванням увімкнено
-            })
+            cursor = db.users.find({"queues": {"$exists": True, "$ne": []},"reminders": True})
             users = await cursor.to_list(length=None)
             
             for user in users:
@@ -1253,7 +1273,7 @@ async def check_and_send_reminder(user_id: int, queue_id: str, date_str: str, ti
         # Парсимо час події
         day, month, year = date_str.split('.')
         hour, minute = time_str.split(':')
-        event_time = datetime(int(year), int(month), int(day), int(hour), int(minute))
+        event_time = datetime(int(year), int(month), int(day), int(hour), int(minute), tzinfo=KYIV_TZ)
         
         # Різниця в хвилинах
         diff = (event_time - now).total_seconds() / 60
@@ -1330,7 +1350,7 @@ async def handle_health(request):
     return web.json_response({
         "status": "ok",
         "service": "lumos-bot",
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now(KYIV_TZ).isoformat()
     })
 
 async def start_web_server():
