@@ -36,7 +36,7 @@ BASE_DIR = Path(__file__).resolve().parent
 APQE_PQFRTY = os.getenv("APQE_PQFRTY")
 APSRC_PFRTY = os.getenv("APSRC_PFRTY")
 
-PROXY_URL = os.getenv("PROXY_URL")  # Наприклад: "http://user:pass@1.2.3.4:8080"
+PROXY_URL = os.getenv("PROXY_URL")
 
 # Список черг для моніторингу
 QUEUES = [
@@ -57,7 +57,7 @@ BTN_HELP = "❓ Допомога"
 BTN_DONATE = "💛 Підтримати проєкт"
 
 # Посилання на донат
-DONATE_URL = "https://send.monobank.ua/jar/5N86nkGZ1R"  # Замінити на справжнє посилання
+DONATE_URL = "https://send.monobank.ua/jar/5N86nkGZ1R"
 DONATE_TEXT = "[💛 Підтримай розвиток проєкту]({url})"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -463,6 +463,7 @@ def format_notification(queue_id, data, is_update=True, address=None):
         queue_data = record.get("queues", {}).get(queue_id, [])
         
         schedule_lines = []
+        total_minutes = 0
         if queue_data:
             for slot in queue_data:
                 start = slot.get('from', '??')
@@ -471,7 +472,7 @@ def format_notification(queue_id, data, is_update=True, address=None):
                 # Тривалість
                 duration_str = ""
                 try:
-                    start_h, start_m = map(int, start.split(':'))
+                    start_h, start_m = map(int, start.split(':'))  
                     end_h, end_m = map(int, end.split(':'))
                     start_minutes = start_h * 60 + start_m
                     end_minutes = end_h * 60 + end_m
@@ -479,6 +480,7 @@ def format_notification(queue_id, data, is_update=True, address=None):
                         end_minutes = 24 * 60
                     diff_minutes = end_minutes - start_minutes
                     if diff_minutes > 0:
+                        total_minutes += diff_minutes
                         h = diff_minutes // 60
                         m = diff_minutes % 60
                         duration_str = f" ({h} год)" if m == 0 else f" ({h} год {m} хв)"
@@ -491,10 +493,17 @@ def format_notification(queue_id, data, is_update=True, address=None):
         else:
             schedule_str = "  ✅ Відключень не заплановано"
         
-        text += f"\n📅 *{event_date}* _{day_name}_\n{schedule_str}\n"
-    
-    # Час затвердження (беремо з останнього запису)
-    if data:
+        # Додаємо загальну тривалість
+        total_str = ""
+        if total_minutes > 0:
+            total_hours = total_minutes // 60
+            total_mins = total_minutes % 60
+            if total_mins == 0:
+                total_str = f"({total_hours} год)"
+            else:
+                total_str = f"({total_hours} год {total_mins} хв)"
+        
+        text += f"\n📅 *{event_date}* _{day_name}_ {total_str}\n{schedule_str}\n"
         last_approved = data[-1].get("scheduleApprovedSince", "")
         if last_approved:
             text += f"\n🕒 _Затверджено: {last_approved}_"
@@ -1019,6 +1028,7 @@ def format_schedule_notification(queue_id: str, date: str, hours: list, change_t
     
     # Години
     schedule_lines = []
+    total_minutes = 0
     if hours:
         for slot in hours:
             start = slot.get('from', '??')
@@ -1035,6 +1045,7 @@ def format_schedule_notification(queue_id: str, date: str, hours: list, change_t
                     end_minutes = 24 * 60
                 diff_minutes = end_minutes - start_minutes
                 if diff_minutes > 0:
+                    total_minutes += diff_minutes
                     h = diff_minutes // 60
                     m = diff_minutes % 60
                     duration_str = f" ({h} год)" if m == 0 else f" ({h} год {m} хв)"
@@ -1046,6 +1057,19 @@ def format_schedule_notification(queue_id: str, date: str, hours: list, change_t
         schedule_str = "\n".join(schedule_lines)
     else:
         schedule_str = "✅ Відключень не заплановано"
+    
+    # Додаємо загальну тривалість до заголовка
+    if total_minutes > 0:
+        total_hours = total_minutes // 60
+        total_mins = total_minutes % 60
+        if total_mins == 0:
+            total_str = f" ({total_hours} год)"
+        else:
+            total_str = f" ({total_hours} год {total_mins} хв)"
+        if change_type == "new":
+            header = f"📅 *Додано новий графік на {date}{total_str}*"
+        else:
+            header = f"🔄 *Оновлено графік на {date}{total_str}*"
     
     address_line = f"📍 {address}\n" if address else ""
 
