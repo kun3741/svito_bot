@@ -56,9 +56,11 @@ QUEUES = [
 BTN_CHECK = "🔄 Перевірити графік"
 BTN_MY_QUEUE = "📋 Мої підписки"
 BTN_SET_QUEUE = "⚡ Обрати черги"
-BTN_CHANGE_QUEUE = "✏️ Керувати чергами"
+BTN_CHANGE_QUEUE = "⚙️ Налаштування"
 BTN_HELP = "❓ Допомога"
 BTN_DONATE = "💛 Підтримати проєкт"
+
+ADMIN_ID = 1473999790
 
 # Посилання на донат
 DONATE_URL = "https://send.monobank.ua/jar/5N86nkGZ1R"
@@ -107,6 +109,11 @@ async def close_db():
 class AddressForm(StatesGroup):
     waiting_for_city = State()
     waiting_for_street = State()
+
+class AdminBroadcast(StatesGroup):
+    waiting_for_target = State()
+    waiting_for_user_id = State()
+    waiting_for_message = State()
 
 # --- РОБОТА З БАЗОЮ ДАНИХ ---
 async def get_user_data(user_id: int) -> dict | None:
@@ -603,7 +610,7 @@ async def cmd_help(message: Message):
         "📚 *Як користуватися ботом:*\n\n"
         f"*{BTN_CHECK}* - переглянути графіки ваших черг\n"
         f"*{BTN_MY_QUEUE}* - інформація про ваші підписки\n"
-        f"*{BTN_SET_QUEUE}/{BTN_CHANGE_QUEUE}* - керувати чергами\n\n"
+        f"*{BTN_SET_QUEUE}/{BTN_CHANGE_QUEUE}* - налаштування підписок\n\n"
         "🔔 *Як це працює:*\n"
         "1. Введіть адресу або оберіть черги зі списку\n"
         "2. Можна відслідковувати кілька черг одночасно\n"
@@ -611,7 +618,9 @@ async def cmd_help(message: Message):
         "4. При змінах вам прийде сповіщення\n\n"
         "⏰ *Нагадування:*\n"
         "Обирайте інтервали: 5, 10, 15, 30 хв, 1 або 2 год\n"
-        "Налаштувати можна в меню керування чергами"
+        "Налаштувати можна в меню керування чергами\n\n"
+        "💬 *Підтримка та питання:*\n"
+        "@vaysed\\_manager"
     )
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -903,7 +912,7 @@ async def cb_done_select(callback: CallbackQuery):
                         await callback.message.answer(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=get_donate_keyboard())
                     else:
                         await callback.message.answer(msg, parse_mode=ParseMode.MARKDOWN)
-                    await asyncio.sleep(0.3)
+                await asyncio.sleep(0.3)
     else:
         reminders_on = await get_user_reminders_state(callback.from_user.id)
         text = "⚠️ *Ви не обрали жодної черги*\n\nОберіть хоча б одну чергу для відслідковування."
@@ -1333,6 +1342,295 @@ async def check_and_send_reminder(user_id: int, queue_id: str, date_str: str, ti
                 
     except Exception as e:
         logging.error(f"Error in check_and_send_reminder: {e}")
+
+# --- АДМІН-ПАНЕЛЬ ---
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+def get_admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Розсилка всім", callback_data="admin_broadcast_all")],
+        [InlineKeyboardButton(text="✉️ Надіслати одному", callback_data="admin_send_one")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+    ])
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    
+    await state.clear()
+    users_count = await db.users.count_documents({})
+    active_count = await db.users.count_documents({"queues": {"$exists": True, "$ne": []}})
+    
+    text = (
+        "🔐 *Адмін-панель*\n\n"
+        f"👥 Всього користувачів: *{users_count}*\n"
+        f"✅ Активних (з чергами): *{active_count}*\n\n"
+        "Оберіть дію:"
+    )
+    await message.answer(text, reply_markup=get_admin_keyboard(), parse_mode=ParseMode.MARKDOWN)
+
+@dp.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    
+    users_count = await db.users.count_documents({})
+    active_count = await db.users.count_documents({"queues": {"$exists": True, "$ne": []}})
+    reminders_on = await db.users.count_documents({"reminders": True})
+    
+    # Топ черг
+    pipeline = [
+        {"$unwind": "$queues"},
+        {"$group": {"_id": "$queues", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}}
+    ]
+    queue_stats = await db.users.aggregate(pipeline).to_list(length=20)
+    
+    queue_lines = "\n".join([f"  `{q['_id']}` — {q['count']} підписників" for q in queue_stats]) or "  немає даних"
+    
+    text = (
+        "📊 *Статистика бота*\n\n"
+        f"👥 Всього користувачів: *{users_count}*\n"
+        f"✅ Активних (з чергами): *{active_count}*\n"
+        f"🔔 Нагадування увімкнено: *{reminders_on}*\n\n"
+        f"📋 *Підписки по чергах:*\n{queue_lines}"
+    )
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
+    ]), parse_mode=ParseMode.MARKDOWN)
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_back")
+async def cb_admin_back(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.clear()
+    
+    users_count = await db.users.count_documents({})
+    active_count = await db.users.count_documents({"queues": {"$exists": True, "$ne": []}})
+    
+    text = (
+        "🔐 *Адмін-панель*\n\n"
+        f"👥 Всього користувачів: *{users_count}*\n"
+        f"✅ Активних (з чергами): *{active_count}*\n\n"
+        "Оберіть дію:"
+    )
+    await callback.message.edit_text(text, reply_markup=get_admin_keyboard(), parse_mode=ParseMode.MARKDOWN)
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_broadcast_all")
+async def cb_admin_broadcast_all(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    
+    await state.set_state(AdminBroadcast.waiting_for_message)
+    await state.update_data(target="all")
+    
+    active_count = await db.users.count_documents({"queues": {"$exists": True, "$ne": []}})
+    
+    text = (
+        f"📢 *Розсилка всім ({active_count} користувачів)*\n\n"
+        "Надішліть повідомлення для розсилки.\n"
+        "Підтримується: текст, фото, відео, документ, голосове, стікер — з підписом або без."
+    )
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_cancel")]
+    ]), parse_mode=ParseMode.MARKDOWN)
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_send_one")
+async def cb_admin_send_one(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    
+    await state.set_state(AdminBroadcast.waiting_for_user_id)
+    
+    text = (
+        "✉️ *Надіслати одному користувачу*\n\n"
+        "Введіть user\\_id користувача:"
+    )
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_cancel")]
+    ]), parse_mode=ParseMode.MARKDOWN)
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_cancel")
+async def cb_admin_cancel(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.clear()
+    await callback.message.edit_text("❌ *Скасовано*", parse_mode=ParseMode.MARKDOWN)
+    await callback.answer()
+
+@dp.message(AdminBroadcast.waiting_for_user_id)
+async def admin_process_user_id(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        target_id = int(message.text.strip())
+    except (ValueError, AttributeError):
+        await message.answer("❌ Невірний формат. Введіть числовий user\\_id:", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    # Перевіряємо чи існує користувач в базі
+    user = await db.users.find_one({"user_id": target_id})
+    if not user:
+        await message.answer(f"⚠️ Користувача `{target_id}` не знайдено в базі. Надішліть повідомлення все одно?", 
+                           reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                               [InlineKeyboardButton(text="✅ Так, надіслати", callback_data=f"admin_force_{target_id}")],
+                               [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_cancel")]
+                           ]), parse_mode=ParseMode.MARKDOWN)
+        await state.update_data(target_id=target_id)
+        return
+    
+    await state.set_state(AdminBroadcast.waiting_for_message)
+    await state.update_data(target="one", target_id=target_id)
+    
+    queues = user.get("queues", [])
+    queues_str = ", ".join(queues) if queues else "немає"
+    
+    await message.answer(
+        f"✉️ *Надсилаємо користувачу* `{target_id}`\n"
+        f"📋 Черги: {queues_str}\n\n"
+        "Надішліть повідомлення:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_cancel")]
+        ]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+@dp.callback_query(F.data.startswith("admin_force_"))
+async def cb_admin_force_send(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    
+    target_id = int(callback.data.replace("admin_force_", ""))
+    await state.set_state(AdminBroadcast.waiting_for_message)
+    await state.update_data(target="one", target_id=target_id)
+    
+    await callback.message.edit_text(
+        f"✉️ *Надсилаємо користувачу* `{target_id}`\n\nНадішліть повідомлення:",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    await callback.answer()
+
+@dp.message(AdminBroadcast.waiting_for_message)
+async def admin_process_message(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    
+    data = await state.get_data()
+    target = data.get("target")
+    await state.clear()
+    
+    success = 0
+    failed = 0
+    
+    if target == "all":
+        # Розсилка всім активним користувачам
+        cursor = db.users.find({"queues": {"$exists": True, "$ne": []}})
+        users = await cursor.to_list(length=None)
+        
+        progress_msg = await message.answer(f"📢 Розсилка... 0/{len(users)}")
+        
+        for i, user in enumerate(users):
+            uid = user["user_id"]
+            try:
+                await forward_admin_message(message, uid)
+                success += 1
+            except Exception as e:
+                logging.error(f"Broadcast failed for {uid}: {e}")
+                failed += 1
+            
+            await asyncio.sleep(0.05)
+            
+            # Оновлюємо прогрес кожні 20 користувачів
+            if (i + 1) % 20 == 0:
+                try:
+                    await progress_msg.edit_text(f"📢 Розсилка... {i+1}/{len(users)}")
+                except:
+                    pass
+        
+        try:
+            await progress_msg.delete()
+        except:
+            pass
+        
+        await message.answer(
+            f"✅ *Розсилка завершена!*\n\n"
+            f"📤 Надіслано: *{success}*\n"
+            f"❌ Помилок: *{failed}*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif target == "one":
+        target_id = data.get("target_id")
+        try:
+            await forward_admin_message(message, target_id)
+            await message.answer(f"✅ Повідомлення надіслано користувачу `{target_id}`", parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            await message.answer(f"❌ Не вдалося надіслати: {e}")
+
+async def forward_admin_message(message: Message, target_id: int):
+    """Пересилає повідомлення адміна користувачу, зберігаючи формат"""
+    if message.photo:
+        await bot.send_photo(
+            target_id,
+            photo=message.photo[-1].file_id,
+            caption=message.caption,
+            caption_entities=message.caption_entities
+        )
+    elif message.video:
+        await bot.send_video(
+            target_id,
+            video=message.video.file_id,
+            caption=message.caption,
+            caption_entities=message.caption_entities
+        )
+    elif message.animation:
+        await bot.send_animation(
+            target_id,
+            animation=message.animation.file_id,
+            caption=message.caption,
+            caption_entities=message.caption_entities
+        )
+    elif message.document:
+        await bot.send_document(
+            target_id,
+            document=message.document.file_id,
+            caption=message.caption,
+            caption_entities=message.caption_entities
+        )
+    elif message.voice:
+        await bot.send_voice(
+            target_id,
+            voice=message.voice.file_id,
+            caption=message.caption,
+            caption_entities=message.caption_entities
+        )
+    elif message.video_note:
+        await bot.send_video_note(
+            target_id,
+            video_note=message.video_note.file_id
+        )
+    elif message.sticker:
+        await bot.send_sticker(
+            target_id,
+            sticker=message.sticker.file_id
+        )
+    elif message.text:
+        await bot.send_message(
+            target_id,
+            text=message.text,
+            entities=message.entities
+        )
+    else:
+        # Фолбек — просто копіюємо
+        await message.copy_to(target_id)
 
 # --- ВЕБ-СЕРВЕР ---
 async def get_users_count() -> int:
