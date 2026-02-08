@@ -297,23 +297,28 @@ def get_main_keyboard(has_queue: bool = False) -> ReplyKeyboardMarkup:
 
 def get_queue_choice_keyboard(reminders_on: bool = True) -> InlineKeyboardMarkup:
     """Вибір способу встановлення черги"""
-    reminder_text = "🔔 Нагадування: ВКЛ" if reminders_on else "🔕 Нагадування: ВИКЛ"
+    reminder_icon = "🔔" if reminders_on else "🔕"
     buttons = [
         [InlineKeyboardButton(text="🏠 Додати за адресою", callback_data="enter_address")],
         [InlineKeyboardButton(text="🔢 Обрати зі списку", callback_data="select_queue")],
-        [InlineKeyboardButton(text=reminder_text, callback_data="toggle_reminders")],
-        [InlineKeyboardButton(text="⏰ Налаштувати нагадування", callback_data="reminder_settings")],
+        [InlineKeyboardButton(text=f"{reminder_icon} Нагадування", callback_data="reminder_settings")],
         [InlineKeyboardButton(text="🗑 Скасувати всі підписки", callback_data="unsubscribe")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_reminder_intervals_keyboard(selected_intervals: list[int]) -> InlineKeyboardMarkup:
-    """Клавіатура вибору інтервалів нагадувань"""
+def get_reminder_intervals_keyboard(selected_intervals: list[int], reminders_on: bool = True) -> InlineKeyboardMarkup:
+    """Клавіатура вибору інтервалів нагадувань з кнопкою увімк/вимк"""
     buttons = []
-    row = []
     
+    # Кнопка увімкнення/вимкнення нагадувань
+    if reminders_on:
+        buttons.append([InlineKeyboardButton(text="🔔 Нагадування УВІМКНЕНО — натисни щоб вимкнути", callback_data="toggle_reminders")])
+    else:
+        buttons.append([InlineKeyboardButton(text="🔕 Нагадування ВИМКНЕНО — натисни щоб увімкнути", callback_data="toggle_reminders")])
+    
+    # Інтервали
+    row = []
     for interval, label in AVAILABLE_REMINDER_INTERVALS.items():
-        # Позначаємо обрані інтервали галочкою
         text = f"✅ {label}" if interval in selected_intervals else f"⬜ {label}"
         row.append(InlineKeyboardButton(text=text, callback_data=f"reminder_int_{interval}"))
         if len(row) == 3:
@@ -908,23 +913,29 @@ async def cb_done_select(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "toggle_reminders")
 async def cb_toggle_reminders(callback: CallbackQuery):
+    """Перемикає стан нагадувань і оновлює екран налаштувань"""
     new_state = await toggle_user_reminders(callback.from_user.id)
-    user_data = await get_user_data(callback.from_user.id)
-    queues = user_data.get("queues", []) if user_data else []
+    intervals = await get_user_reminder_intervals(callback.from_user.id)
     
-    if queues:
-        status = format_user_status(user_data)
-        text = f"✏️ *Керування підписками*\n\n*Поточні підписки:*\n{status}\n\nОберіть спосіб:"
+    if intervals:
+        selected = [AVAILABLE_REMINDER_INTERVALS[i] for i in sorted(intervals, reverse=True) if i in AVAILABLE_REMINDER_INTERVALS]
+        selected_text = ", ".join(selected)
     else:
-        text = "⚡ *Оберіть спосіб налаштування:*"
+        selected_text = "не обрано"
+    
+    status_text = "увімкнено ✅" if new_state else "вимкнено ❌"
+    
+    text = (
+        f"⏰ *Налаштування нагадувань*\n\n"
+        f"*Стан:* {status_text}\n"
+        f"*Обрані інтервали:* {selected_text}\n\n"
+        "Натисніть на інтервал щоб додати/видалити:"
+    )
     
     try:
-        await callback.message.edit_text(text, reply_markup=get_queue_choice_keyboard(new_state), parse_mode=ParseMode.MARKDOWN)
+        await callback.message.edit_text(text, reply_markup=get_reminder_intervals_keyboard(intervals, new_state), parse_mode=ParseMode.MARKDOWN)
     except TelegramBadRequest as e:
-        # Ігноруємо помилку, якщо повідомлення не змінилося (наприклад, при подвійному кліку)
-        if "message is not modified" in str(e):
-            pass
-        else:
+        if "message is not modified" not in str(e):
             raise e
     
     state_text = "увімкнено" if new_state else "вимкнено"
@@ -934,21 +945,24 @@ async def cb_toggle_reminders(callback: CallbackQuery):
 async def cb_reminder_settings(callback: CallbackQuery):
     """Показує налаштування інтервалів нагадувань"""
     intervals = await get_user_reminder_intervals(callback.from_user.id)
+    reminders_on = await get_user_reminders_state(callback.from_user.id)
     
-    # Формуємо текст обраних інтервалів
     if intervals:
         selected = [AVAILABLE_REMINDER_INTERVALS[i] for i in sorted(intervals, reverse=True) if i in AVAILABLE_REMINDER_INTERVALS]
         selected_text = ", ".join(selected)
     else:
         selected_text = "не обрано"
     
+    status_text = "увімкнено ✅" if reminders_on else "вимкнено ❌"
+    
     text = (
         "⏰ *Налаштування нагадувань*\n\n"
+        f"*Стан:* {status_text}\n"
         f"*Обрані інтервали:* {selected_text}\n\n"
         "Натисніть на інтервал щоб додати/видалити:"
     )
     
-    await callback.message.edit_text(text, reply_markup=get_reminder_intervals_keyboard(intervals), parse_mode=ParseMode.MARKDOWN)
+    await callback.message.edit_text(text, reply_markup=get_reminder_intervals_keyboard(intervals, reminders_on), parse_mode=ParseMode.MARKDOWN)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("reminder_int_"))
@@ -961,21 +975,24 @@ async def cb_toggle_reminder_interval(callback: CallbackQuery):
         return
     
     new_intervals = await toggle_reminder_interval(callback.from_user.id, interval)
+    reminders_on = await get_user_reminders_state(callback.from_user.id)
     
-    # Формуємо текст
     if new_intervals:
         selected = [AVAILABLE_REMINDER_INTERVALS[i] for i in sorted(new_intervals, reverse=True) if i in AVAILABLE_REMINDER_INTERVALS]
         selected_text = ", ".join(selected)
     else:
         selected_text = "не обрано"
     
+    status_text = "увімкнено ✅" if reminders_on else "вимкнено ❌"
+    
     text = (
         "⏰ *Налаштування нагадувань*\n\n"
+        f"*Стан:* {status_text}\n"
         f"*Обрані інтервали:* {selected_text}\n\n"
         "Натисніть на інтервал щоб додати/видалити:"
     )
     
-    await callback.message.edit_text(text, reply_markup=get_reminder_intervals_keyboard(new_intervals), parse_mode=ParseMode.MARKDOWN)
+    await callback.message.edit_text(text, reply_markup=get_reminder_intervals_keyboard(new_intervals, reminders_on), parse_mode=ParseMode.MARKDOWN)
     
     label = AVAILABLE_REMINDER_INTERVALS[interval]
     if interval in new_intervals:
@@ -1211,6 +1228,18 @@ async def reminder_checker():
             if now.hour == 3 and now.minute < 2:
                 await cleanup_old_reminders()
             
+            # Завантажуємо графіки для ВСІХ черг один раз (кеш)
+            schedules_cache = {}
+            for queue_id in QUEUES:
+                data = await fetch_schedule(None, queue_id)
+                if data:
+                    schedule_data = data if isinstance(data, list) else data.get("schedule", [])
+                    for record in schedule_data:
+                        if record.get("eventDate") == today_str:
+                            schedules_cache[queue_id] = record.get("queues", {}).get(queue_id, [])
+                            break
+                await asyncio.sleep(0.2)
+            
             # Отримуємо всіх користувачів з підписками та увімкненими нагадуваннями
             cursor = db.users.find({"queues": {"$exists": True, "$ne": []},"reminders": True})
             users = await cursor.to_list(length=None)
@@ -1224,42 +1253,28 @@ async def reminder_checker():
                 if not user_intervals:
                     continue
                 
+                # Оновлюємо now для кожного користувача
+                now = datetime.now(KYIV_TZ)
+                
                 for queue_id in queues:
-                    # Отримуємо графік для черги
-                    data = await fetch_schedule(None, queue_id)
-                    if not data:
-                        continue
+                    queue_data = schedules_cache.get(queue_id, [])
                     
-                    # Знаходимо графік на сьогодні
-                    schedule_data = data if isinstance(data, list) else data.get("schedule", [])
-                    
-                    for record in schedule_data:
-                        event_date = record.get("eventDate", "")
-                        if event_date != today_str:
+                    for slot in queue_data:
+                        from_time = slot.get("from", "")
+                        to_time = slot.get("to", "")
+                        
+                        if not from_time or not to_time:
                             continue
                         
-                        queue_data = record.get("queues", {}).get(queue_id, [])
+                        # Перевіряємо нагадування для ВИМКНЕННЯ (from_time)
+                        await check_and_send_reminder(
+                            user_id, queue_id, today_str, from_time, "off", now, user_intervals
+                        )
                         
-                        for slot in queue_data:
-                            from_time = slot.get("from", "")
-                            to_time = slot.get("to", "")
-                            
-                            if not from_time or not to_time:
-                                continue
-                            
-                            # Перевіряємо нагадування для ВИМКНЕННЯ (from_time)
-                            await check_and_send_reminder(
-                                user_id, queue_id, today_str, from_time, "off", now, user_intervals
-                            )
-                            
-                            # Перевіряємо нагадування для УВІМКНЕННЯ (to_time)
-                            await check_and_send_reminder(
-                                user_id, queue_id, today_str, to_time, "on", now, user_intervals
-                            )
-                    
-                    await asyncio.sleep(0.1)
-                
-                await asyncio.sleep(0.1)
+                        # Перевіряємо нагадування для УВІМКНЕННЯ (to_time)
+                        await check_and_send_reminder(
+                            user_id, queue_id, today_str, to_time, "on", now, user_intervals
+                        )
             
         except Exception as e:
             logging.error(f"Reminder checker error: {e}")
