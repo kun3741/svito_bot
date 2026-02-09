@@ -3,7 +3,10 @@ import logging
 import json
 import ssl
 import os
+import re
+import requests
 from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
 from pathlib import Path
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
@@ -40,6 +43,13 @@ APSRC_PFRTY = os.getenv("APSRC_PFRTY")
 
 PROXY_URL = os.getenv("PROXY_URL")
 
+LVIV_API_URL = os.getenv("APQE_LOE")
+LVIV_POWER_API_URL = os.getenv("APWR_LOE")
+
+# Регіони
+REGION_IF = "if"      
+REGION_LVIV = "lviv"  
+
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 # Список черг для моніторингу
@@ -64,6 +74,7 @@ ADMIN_ID = 1473999790
 
 # Посилання на донат
 DONATE_URL = "https://send.monobank.ua/jar/5N86nkGZ1R"
+DONATE_PRIV_URL = "https://www.privat24.ua/send/i7yrx"
 DONATE_TEXT = "[💛 Підтримай розвиток проєкту]({url})"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -89,6 +100,14 @@ async def init_db():
         collections = await db.list_collection_names()
         logging.info(f"✅ Connected to MongoDB. Collections: {collections}")
         
+        # Міграція: встановити region для існуючих користувачів
+        migrated = await db.users.update_many(
+            {"region": {"$exists": False}},
+            {"$set": {"region": REGION_IF}}
+        )
+        if migrated.modified_count > 0:
+            logging.info(f"🔄 Migrated {migrated.modified_count} users → region '{REGION_IF}'")
+        
         # Рахуємо документи
         users_count = await db.users.count_documents({})
         states_count = await db.schedule_state.count_documents({})
@@ -110,6 +129,11 @@ class AddressForm(StatesGroup):
     waiting_for_city = State()
     waiting_for_street = State()
 
+class LvivAddressForm(StatesGroup):
+    waiting_for_city_search = State()
+    waiting_for_street_search = State()
+    waiting_for_house = State()
+
 class AdminBroadcast(StatesGroup):
     waiting_for_target = State()
     waiting_for_user_id = State()
@@ -127,8 +151,9 @@ async def get_user_data(user_id: int) -> dict | None:
         return {
             "queues": queues, 
             "address": user.get("address"),
-            "reminders": user.get("reminders", False),  # За замовчуванням увімкнено
-            "reminder_intervals": user.get("reminder_intervals", DEFAULT_REMINDER_INTERVALS)
+            "reminders": user.get("reminders", False),
+            "reminder_intervals": user.get("reminder_intervals", DEFAULT_REMINDER_INTERVALS),
+            "region": user.get("region", REGION_IF)
         }
     return None
 
@@ -169,14 +194,31 @@ async def get_user_queues(user_id: int) -> list[str]:
         return data.get("queues", [])
     return []
 
+async def get_user_region(user_id: int) -> str | None:
+    """Повертає регіон користувача або None"""
+    user = await db.users.find_one({"user_id": user_id})
+    if user:
+        return user.get("region", REGION_IF)
+    return None
+
+async def set_user_region(user_id: int, region: str):
+    """Встановлює регіон користувача"""
+    await db.users.update_one(
+        {"user_id": user_id},
+        {"$set": {"region": region, "updated_at": datetime.now(KYIV_TZ)}},
+        upsert=True
+    )
+
 async def remove_user_queue(user_id: int):
     """Видаляє всі підписки користувача"""
     await db.users.delete_one({"user_id": user_id})
 
-async def get_users_by_queue(queue: str) -> list[int]:
-    """Повертає список user_id підписаних на певну чергу"""
-    # Пошук в масиві queues або в старому полі queue
-    cursor = db.users.find({"$or": [{"queues": queue}, {"queue": queue}]})
+async def get_users_by_queue(queue: str, region: str = None) -> list[int]:
+    """Повертає список user_id підписаних на певну чергу (з фільтром за регіоном)"""
+    query = {"$or": [{"queues": queue}, {"queue": queue}]}
+    if region:
+        query["region"] = region
+    cursor = db.users.find(query)
     users = await cursor.to_list(length=None)
     return [user["user_id"] for user in users]
 
@@ -373,6 +415,13 @@ def get_donate_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💛 Підтримати проєкт", callback_data="show_donate")]
     ])
 
+def get_region_keyboard() -> InlineKeyboardMarkup:
+    """Клавіатура вибору регіону"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏔 Івано-Франківська обл.", callback_data="region_if")],
+        [InlineKeyboardButton(text="🦁 Львівська обл.", callback_data="region_lviv")],
+    ])
+
 # --- ОТРИМАННЯ ДАНИХ ---
 def get_ssl_context():
     ssl_context = ssl.create_default_context()
@@ -396,10 +445,10 @@ async def fetch_schedule(session, queue_id):
             if response.status_code == 200:
                 return response.json()
             else:
-                logging.error(f"API returned {response.status_code} for queue {queue_id}")
+                logging.error(f"[ІФ] API returned {response.status_code} for queue {queue_id}")
                 return None
     except Exception as e:
-        logging.error(f"Error fetching {queue_id}: {e}")
+        logging.error(f"[ІФ] Error fetching {queue_id}: {e}")
         return None
 
 async def fetch_schedule_by_address(city: str, street: str, house: str) -> dict | None:
@@ -448,6 +497,179 @@ def extract_queue_from_response(data) -> tuple[str | None, list | None]:
             return queue_id, schedule
     
     return None, None
+
+# --- ЛЬВІВСЬКА ОБЛАСТЬ (API ЛОЕ) ---
+def _parse_lviv_html(html: str) -> tuple[str | None, dict]:
+    """Парсить HTML одного дня. Повертає (date_str, {group: [(from,to),...]})"""
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(separator=" ", strip=True)
+    text = re.sub(r"\s+", " ", text)
+    
+    # Витягуємо дату з заголовка: "Графік ... на 09.02.2026"
+    date_match = re.search(r"\b(\d{2}\.\d{2}\.\d{4})\b", text)
+    date_str = date_match.group(1) if date_match else None
+    
+    result = {}
+    for g in QUEUES:
+        pattern = rf"Група\s*{re.escape(g)}\b(.*?)(?=Група|$)"
+        m = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+        if not m:
+            continue
+        group_text = m.group(1)
+        times = re.findall(r"(\d{2}:\d{2})\s*(?:-|–|до|to)\s*(\d{2}:\d{2})", group_text)
+        if not times:
+            single = re.findall(r"(\d{2}:\d{2})", group_text)
+            if len(single) >= 2:
+                times = [(single[i], single[i + 1]) for i in range(0, len(single) - 1, 2)]
+        result[g] = times
+    return date_str, result
+
+
+def _fetch_lviv_schedule_sync() -> dict | None:
+    """Завантажує графіки з ЛОЕ API (всі дні: Today, Tomorrow, ...).
+    Повертає {date_str: {group: [(from, to), ...], ...}, ...} або None."""
+    try:
+        resp = requests.get(LVIV_API_URL, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+
+        member = data.get("hydra:member") or []
+        if not member:
+            return None
+
+        menu_items = member[0].get("menuItems", [])
+        
+        all_schedules = {}  # {"09.02.2026": {"1.1": [(...), ...], ...}, "10.02.2026": {...}}
+        
+        for item in menu_items:
+            name = item.get("name", "")
+            html = item.get("rawHtml")
+            if not html:
+                continue
+            # Парсимо Today, Tomorrow та будь-які інші з rawHtml
+            if name in ("Today", "Tomorrow") or "grafic" in name.lower() or "графік" in name.lower():
+                date_str, groups = _parse_lviv_html(html)
+                if date_str and groups:
+                    all_schedules[date_str] = groups
+        
+        return all_schedules if all_schedules else None
+    except Exception as e:
+        logging.error(f"[ЛОЕ] Error fetching Lviv schedule: {e}")
+        return None
+
+
+def _search_lviv_cities_sync(name_part: str) -> list[dict]:
+    """Шукає населені пункти Львівської обл. за назвою"""
+    try:
+        resp = requests.get(
+            f"{LVIV_POWER_API_URL}/pw_cities",
+            params={"name": name_part, "pagination": "false"}, timeout=10,
+        )
+        resp.raise_for_status()
+        results = []
+        for item in resp.json().get("hydra:member", []):
+            otg = item.get("otg", {}).get("name", "")
+            results.append({"id": item["id"], "name": item["name"], "otg": otg})
+        return results
+    except Exception as e:
+        logging.error(f"[ЛОЕ] Error searching Lviv cities: {e}")
+        return []
+
+
+def _search_lviv_streets_sync(city_id: int, name_part: str) -> list[dict]:
+    """Шукає вулиці у населеному пункті Львівської обл."""
+    try:
+        resp = requests.get(
+            f"{LVIV_POWER_API_URL}/pw_streets",
+            params={"city.id": city_id, "name": name_part, "pagination": "false"}, timeout=10,
+        )
+        resp.raise_for_status()
+        results = []
+        for item in resp.json().get("hydra:member", []):
+            results.append({"id": item["id"], "name": item["name"]})
+        return results
+    except Exception as e:
+        logging.error(f"[ЛОЕ] Error searching Lviv streets: {e}")
+        return []
+
+
+def _find_lviv_group_sync(city_id: int, street_id: int, house: str) -> str | None:
+    """Знаходить групу ГПВ за адресою (Львівська обл.)"""
+    try:
+        resp = requests.get(
+            f"{LVIV_POWER_API_URL}/pw_accounts",
+            params={"city.id": city_id, "street.id": street_id, "buildingName": house, "pagination": "false"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        members = resp.json().get("hydra:member", [])
+        if not members:
+            return None
+        raw = members[0].get("chergGpv")
+        if raw and len(raw) == 2 and raw.isdigit():
+            return f"{raw[0]}.{raw[1]}"
+        return raw or None
+    except Exception as e:
+        logging.error(f"[ЛОЕ] Error finding Lviv group: {e}")
+        return None
+
+
+def format_lviv_notification(queue_id: str, slots: list[tuple[str, str]], is_update: bool = False, address: str = None, date_str: str = None) -> str:
+    """Форматує графік Львівської області для однієї групи"""
+    days_names = ["Понеділок", "Вівторок", "Середа", "Четвер", "П'ятниця", "Субота", "Неділя"]
+    now = datetime.now(KYIV_TZ)
+    
+    if not date_str:
+        date_str = now.strftime("%d.%m.%Y")
+    
+    day_name = ""
+    try:
+        d, m, y = date_str.split('.')
+        dt = datetime(int(y), int(m), int(d))
+        day_name = days_names[dt.weekday()]
+    except:
+        pass
+
+    header = "⚡️ *Оновлення ГПВ!*" if is_update else "📊 *Поточний графік*"
+    address_line = f"📍 *Адреса:* {address}\n" if address else ""
+
+    lines = []
+    total_minutes = 0
+    if slots:
+        for start, end in slots:
+            duration_str = ""
+            try:
+                sh, sm = map(int, start.split(":"))
+                eh, em = map(int, end.split(":"))
+                s_min = sh * 60 + sm
+                e_min = eh * 60 + em
+                if e_min == 0:
+                    e_min = 24 * 60
+                diff = e_min - s_min
+                if diff > 0:
+                    total_minutes += diff
+                    h, m = divmod(diff, 60)
+                    duration_str = f" ({h} год)" if m == 0 else f" ({h} год {m} хв)"
+            except Exception:
+                pass
+            lines.append(f"  🔴 {start} - {end}{duration_str}")
+        schedule_str = "\n".join(lines)
+    else:
+        schedule_str = "  ✅ Відключень не заплановано"
+
+    total_str = ""
+    if total_minutes > 0:
+        th, tm = divmod(total_minutes, 60)
+        total_str = f" ({th} год)" if tm == 0 else f" ({th} год {tm} хв)"
+
+    text = (
+        f"{header}\n\n"
+        f"{address_line}"
+        f"🔢 *Група:* {queue_id}\n"
+        f"📅 *{date_str}* _{day_name}_ {total_str}\n\n"
+        f"{schedule_str}"
+    )
+    return text
 
 # --- ФОРМАТУВАННЯ ПОВІДОМЛЕННЯ ---
 def format_notification(queue_id, data, is_update=True, address=None):
@@ -554,7 +776,11 @@ def format_user_status(user_data) -> str:
             else:
                 reminders_str = "ВИКЛ"
             
+            region = user_data.get("region", REGION_IF)
+            region_name = "🏔 Івано-Франківська" if region == REGION_IF else "🦁 Львівська"
+            
             lines = []
+            lines.append(f"🗺 *Регіон:* {region_name}")
             if address:
                 lines.append(f"📍 *Адреса:* {address}")
             lines.append(f"🔢 *{queues_label}:* {queues_str}")
@@ -570,7 +796,18 @@ def format_user_status(user_data) -> str:
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     user_data = await get_user_data(message.from_user.id)
-    queues = user_data.get("queues", []) if user_data else []
+    
+    # Новий користувач — пропонуємо обрати регіон
+    if user_data is None:
+        text = (
+            f"💡 *Привіт, {message.from_user.first_name}!*\n\n"
+            f"Я *Люмос* — допоможу тобі дізнаватись про відключення першим!\n\n"
+            f"🗺 *Спочатку обери свій регіон:*"
+        )
+        await message.answer(text, reply_markup=get_region_keyboard(), parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    queues = user_data.get("queues", [])
     has_queue = len(queues) > 0
     
     if has_queue:
@@ -589,6 +826,38 @@ async def cmd_start(message: Message, state: FSMContext):
         )
     
     await message.answer(text, reply_markup=get_main_keyboard(has_queue), parse_mode=ParseMode.MARKDOWN)
+
+
+@dp.callback_query(F.data == "region_if")
+async def cb_region_if(callback: CallbackQuery):
+    await set_user_region(callback.from_user.id, REGION_IF)
+    text = (
+        "🏔 *Обрано: Івано-Франківська область*\n\n"
+        "⚡ Тепер обирай свою чергу і будь готовим до відключень!\n\n"
+        "🤔 Не знаєш чергу? Натискай «⚡ Обрати чергу» \u2014 я допоможу все знайти!"
+    )
+    try:
+        await callback.message.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+    except TelegramBadRequest:
+        pass
+    await callback.message.answer("Меню:", reply_markup=get_main_keyboard(has_queue=False))
+    await callback.answer("✅ Регіон обрано!")
+
+
+@dp.callback_query(F.data == "region_lviv")
+async def cb_region_lviv(callback: CallbackQuery):
+    await set_user_region(callback.from_user.id, REGION_LVIV)
+    text = (
+        "🦁 *Обрано: Львівська область*\n\n"
+        "⚡ Тепер обирай свою групу і будь готовим до відключень!\n\n"
+        "🤔 Не знаєш групу? Натискай «⚡ Обрати чергу» \u2014 я допоможу все знайти!"
+    )
+    try:
+        await callback.message.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+    except TelegramBadRequest:
+        pass
+    await callback.message.answer("Меню:", reply_markup=get_main_keyboard(has_queue=False))
+    await callback.answer("✅ Регіон обрано!")
 
 
 @dp.message(Command("time"))
@@ -627,45 +896,113 @@ async def cmd_help(message: Message):
 # --- ХЕНДЛЕРИ КНОПОК КЛАВІАТУРИ ---
 @dp.message(F.text == BTN_CHECK)
 async def btn_check(message: Message):
-    user_queues = await get_user_queues(message.from_user.id)
+    user_data = await get_user_data(message.from_user.id)
+    region = user_data.get("region", REGION_IF) if user_data else None
+    
+    # Немає регіону — пропонуємо обрати
+    if not region:
+        await message.answer("🗺 *Спочатку оберіть регіон:*", reply_markup=get_region_keyboard(), parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    user_queues = user_data.get("queues", []) if user_data else []
     
     if not user_queues:
         reminders_on = await get_user_reminders_state(message.from_user.id)
-        await message.answer(
-            "⚠️ Спочатку оберіть чергу!",
-            reply_markup=get_queue_choice_keyboard(reminders_on),
-            parse_mode=ParseMode.MARKDOWN
-        )
+        await message.answer("⚠️ Спочатку оберіть чергу!", reply_markup=get_queue_choice_keyboard(reminders_on), parse_mode=ParseMode.MARKDOWN)
         return
     
     loading_msg = await message.answer("⏳ Завантажую графіки...")
-    
-    ssl_context = get_ssl_context()
-    connector = aiohttp.TCPConnector(ssl=ssl_context)
-    
-    user_data = await get_user_data(message.from_user.id)
     address = user_data.get("address") if isinstance(user_data, dict) else None
     
-    async with aiohttp.ClientSession(connector=connector) as session:
-        results = []
-        for queue in sorted(user_queues):
-            data = await fetch_schedule(session, queue)
-            if data:
-                msg = format_notification(queue, data, is_update=False, address=address if len(user_queues) == 1 else None)
-                results.append(msg)
-        
+    if region == REGION_LVIV:
+        # Львівська область
+        all_schedules = await asyncio.to_thread(_fetch_lviv_schedule_sync)
         await loading_msg.delete()
         
-        if results:
-            for i, msg in enumerate(results):
-                # Додаємо кнопку донату до останнього повідомлення
-                if i == len(results) - 1:
-                    await message.answer(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=get_donate_keyboard())
-                else:
-                    await message.answer(msg, parse_mode=ParseMode.MARKDOWN)
+        if all_schedules is None:
+            await message.answer("❌ Не вдалося отримати дані з API ЛОЕ. Спробуйте пізніше.")
+            return
+        
+        for queue in sorted(user_queues):
+            # Збираємо всі дати для цієї черги
+            queue_days = []
+            for date_str in sorted(all_schedules.keys()):
+                day_data = all_schedules[date_str]
+                slots = day_data.get(queue, [])
+                queue_days.append((date_str, slots))
+            # Формуємо зведене повідомлення як в ІФ
+            if queue_days:
+                days_names = ["Понеділок", "Вівторок", "Середа", "Четвер", "П'ятниця", "Субота", "Неділя"]
+                header = "📊 *Поточний графік*"
+                address_line = f"📍 *Адреса:* {address if len(user_queues) == 1 else ''}\n" if address else ""
+                text = f"{header}\n\n{address_line}🔢 *Група:* {queue}\n"
+                for date_str, slots in queue_days:
+                    # День тижня
+                    day_name = ""
+                    try:
+                        d, m, y = date_str.split('.')
+                        dt = datetime(int(y), int(m), int(d))
+                        day_name = days_names[dt.weekday()]
+                    except:
+                        pass
+                    # Тривалість
+                    total_minutes = 0
+                    lines = []
+                    if slots:
+                        for start, end in slots:
+                            duration_str = ""
+                            try:
+                                sh, sm = map(int, start.split(":"))
+                                eh, em = map(int, end.split(":"))
+                                s_min = sh * 60 + sm
+                                e_min = eh * 60 + em
+                                if e_min == 0:
+                                    e_min = 24 * 60
+                                diff = e_min - s_min
+                                if diff > 0:
+                                    total_minutes += diff
+                                    h, m = divmod(diff, 60)
+                                    duration_str = f" ({h} год)" if m == 0 else f" ({h} год {m} хв)"
+                            except Exception:
+                                pass
+                            lines.append(f"  🔴 {start} - {end}{duration_str}")
+                        schedule_str = "\n".join(lines)
+                    else:
+                        schedule_str = "  ✅ Відключень не заплановано"
+                    # Загальна тривалість
+                    total_str = ""
+                    if total_minutes > 0:
+                        th, tm = divmod(total_minutes, 60)
+                        total_str = f" ({th} год)" if tm == 0 else f" ({th} год {tm} хв)"
+                    text += f"\n📅 {date_str} _{day_name}_ {total_str}\n{schedule_str}\n"
+                await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=get_donate_keyboard())
                 await asyncio.sleep(0.3)
-        else:
-            await message.answer("❌ Не вдалося отримати дані. Спробуйте пізніше.")
+            else:
+                await message.answer(f"❌ Не вдалося отримати дані для черги {queue}.")
+    else:
+        # Івано-Франківська область
+        ssl_context = get_ssl_context()
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            results = []
+            for queue in sorted(user_queues):
+                data = await fetch_schedule(session, queue)
+                if data:
+                    msg = format_notification(queue, data, is_update=False, address=address if len(user_queues) == 1 else None)
+                    results.append(msg)
+            
+            await loading_msg.delete()
+            
+            if results:
+                for i, msg in enumerate(results):
+                    if i == len(results) - 1:
+                        await message.answer(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=get_donate_keyboard())
+                    else:
+                        await message.answer(msg, parse_mode=ParseMode.MARKDOWN)
+                    await asyncio.sleep(0.3)
+            else:
+                await message.answer("❌ Не вдалося отримати дані. Спробуйте пізніше.")
 
 @dp.message(F.text == BTN_MY_QUEUE)
 async def btn_my_queue(message: Message):
@@ -709,7 +1046,8 @@ def get_donate_text() -> str:
         "Кожен донат — добровільний, але саме ваша підтримка допомагає "
         "робити бота кращим: додавати нові функції, покращувати стабільність "
         "та забезпечувати безперебійну роботу. 🙏\n\n"
-        f"🔗 {DONATE_URL}"
+        f"🐱 {DONATE_URL}\n"
+        f"💚 {DONATE_PRIV_URL}"
     )
 
 @dp.message(F.text == BTN_DONATE)
@@ -811,14 +1149,195 @@ async def process_street(message: Message, state: FSMContext):
             parse_mode=ParseMode.MARKDOWN
         )
 
+# --- FSM ХЕНДЛЕРИ ДЛЯ АДРЕСИ (ЛЬВІВ) ---
+@dp.message(LvivAddressForm.waiting_for_city_search)
+async def lviv_city_search(message: Message, state: FSMContext):
+    query = message.text.strip()
+    if len(query) < 2:
+        await message.answer("⚠️ Введіть хоча б 2 символи.", reply_markup=get_cancel_keyboard())
+        return
+    
+    loading = await message.answer("🔍 Шукаю...")
+    cities = await asyncio.to_thread(_search_lviv_cities_sync, query)
+    await loading.delete()
+    
+    if not cities:
+        await message.answer("❌ Населений пункт не знайдено. Спробуйте ще раз:", reply_markup=get_cancel_keyboard())
+        return
+    
+    cities_map = {str(c["id"]): c["name"] for c in cities[:20]}
+    await state.update_data(cities_map=cities_map)
+    
+    buttons = []
+    for c in cities[:20]:
+        label = f"{c['name']} ({c['otg']})" if c["otg"] else c["name"]
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"lcity|{c['id']}")])  
+    buttons.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel_input")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    count = len(cities)
+    more = f"\n_(показано перші 20 з {count})_" if count > 20 else ""
+    await message.answer(
+        f"🏠 Знайдено *{count}* варіантів. Оберіть свій:{more}",
+        reply_markup=kb, parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@dp.callback_query(F.data.startswith("lcity|"))
+async def cb_lviv_city_select(callback: CallbackQuery, state: FSMContext):
+    city_id = callback.data.split("|", 1)[1]
+    data = await state.get_data()
+    cities_map = data.get("cities_map", {})
+    city_name = cities_map.get(city_id, f"ID:{city_id}")
+    
+    await state.update_data(city_id=city_id, city_name=city_name)
+    await state.set_state(LvivAddressForm.waiting_for_street_search)
+    
+    await callback.answer()
+    try:
+        await callback.message.edit_text(
+            f"✅ *Обрано:* {city_name}\n\n🏠 *Тепер введіть назву вулиці:*\n\nНаприклад: `Шевченка`",
+            reply_markup=get_cancel_keyboard(), parse_mode=ParseMode.MARKDOWN,
+        )
+    except TelegramBadRequest:
+        pass
+
+
+@dp.message(LvivAddressForm.waiting_for_street_search)
+async def lviv_street_search(message: Message, state: FSMContext):
+    query = message.text.strip()
+    if len(query) < 2:
+        await message.answer("⚠️ Введіть хоча б 2 символи.", reply_markup=get_cancel_keyboard())
+        return
+    
+    data = await state.get_data()
+    city_id = int(data["city_id"])
+    
+    loading = await message.answer("🔍 Шукаю...")
+    streets = await asyncio.to_thread(_search_lviv_streets_sync, city_id, query)
+    await loading.delete()
+    
+    if not streets:
+        await message.answer("❌ Вулицю не знайдено. Спробуйте ще:", reply_markup=get_cancel_keyboard())
+        return
+    
+    streets_map = {str(s["id"]): s["name"] for s in streets[:20]}
+    await state.update_data(streets_map=streets_map)
+    
+    buttons = []
+    for s in streets[:20]:
+        buttons.append([InlineKeyboardButton(text=s["name"], callback_data=f"lstreet|{s['id']}")])  
+    buttons.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel_input")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    count = len(streets)
+    more = f"\n_(показано перші 20 з {count})_" if count > 20 else ""
+    await message.answer(
+        f"🏠 Знайдено *{count}* вулиць. Оберіть:{more}",
+        reply_markup=kb, parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@dp.callback_query(F.data.startswith("lstreet|"))
+async def cb_lviv_street_select(callback: CallbackQuery, state: FSMContext):
+    street_id = callback.data.split("|", 1)[1]
+    data = await state.get_data()
+    streets_map = data.get("streets_map", {})
+    street_name = streets_map.get(street_id, f"ID:{street_id}")
+    city_name = data.get("city_name", "")
+    
+    await state.update_data(street_id=street_id, street_name=street_name)
+    await state.set_state(LvivAddressForm.waiting_for_house)
+    
+    await callback.answer()
+    try:
+        await callback.message.edit_text(
+            f"✅ *Обрано:* {city_name}, {street_name}\n\n"
+            f"🔢 *Введіть номер будинку:*\n\nНаприклад: `7` або `12А`",
+            reply_markup=get_cancel_keyboard(), parse_mode=ParseMode.MARKDOWN,
+        )
+    except TelegramBadRequest:
+        pass
+
+
+@dp.message(LvivAddressForm.waiting_for_house)
+async def lviv_house_input(message: Message, state: FSMContext):
+    house = message.text.strip()
+    if not house:
+        await message.answer("⚠️ Введіть номер будинку:", reply_markup=get_cancel_keyboard())
+        return
+    
+    data = await state.get_data()
+    city_id = int(data["city_id"])
+    city_name = data.get("city_name", "")
+    street_id = int(data["street_id"])
+    street_name = data.get("street_name", "")
+    
+    loading = await message.answer("🔍 Шукаю групу...")
+    group = await asyncio.to_thread(_find_lviv_group_sync, city_id, street_id, house)
+    await loading.delete()
+    await state.clear()
+    
+    full_address = f"{city_name}, {street_name}, {house}"
+    
+    if group:
+        await add_queue_to_user(message.from_user.id, group, full_address)
+        user_queues = await get_user_queues(message.from_user.id)
+        queues_str = ", ".join(sorted(user_queues))
+        
+        text = (
+            f"✅ *Адресу знайдено!*\n\n"
+            f"📍 *Адреса:* {full_address}\n"
+            f"🔢 *Група:* {group}\n\n"
+            f"📋 *Всі ваші групи:* {queues_str}\n"
+            f"🔔 Натисніть \u00ab{BTN_CHECK}\u00bb щоб переглянути графік."
+        )
+        await message.answer(text, reply_markup=get_main_keyboard(has_queue=True), parse_mode=ParseMode.MARKDOWN)
+        
+        # Показуємо графік одразу
+        loading2 = await message.answer("⏳ Завантажую графік...")
+        schedules = await asyncio.to_thread(_fetch_lviv_schedule_sync)
+        await loading2.delete()
+        
+        if schedules is not None:
+            date_keys = list(schedules.keys())
+            for i, date_str in enumerate(date_keys):
+                slots = schedules[date_str].get(group, [])
+                msg = format_lviv_notification(group, slots, address=full_address, date_str=date_str)
+                if i == len(date_keys) - 1:
+                    await message.answer(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=get_donate_keyboard())
+                else:
+                    await message.answer(msg, parse_mode=ParseMode.MARKDOWN)
+                await asyncio.sleep(0.3)
+    else:
+        reminders_on = await get_user_reminders_state(message.from_user.id)
+        await message.answer(
+            f"❌ *Будинок не знайдено*\n\n📍 {full_address}\n\n"
+            "Перевірте правильність номера або оберіть групу вручну.",
+            reply_markup=get_queue_choice_keyboard(reminders_on),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
 # --- CALLBACK ХЕНДЛЕРИ ---
 @dp.callback_query(F.data == "enter_address")
 async def cb_enter_address(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(AddressForm.waiting_for_city)
-    text = (
-        "🏙 *Введіть назву міста/села:*\n\n"
-        "Наприклад: `Івано-Франківськ`"
-    )
+    region = await get_user_region(callback.from_user.id)
+    
+    if region == REGION_LVIV:
+        # Львів — покрокова адреса через power-api
+        await state.set_state(LvivAddressForm.waiting_for_city_search)
+        text = (
+            "🏙 *Введіть назву населеного пункту:*\n\n"
+            "Наприклад: `Львів` або `Броди`"
+        )
+    else:
+        # ІФ — стандартний пошук
+        await state.set_state(AddressForm.waiting_for_city)
+        text = (
+            "🏙 *Введіть назву міста/села:*\n\n"
+            "Наприклад: `Івано-Франківськ`"
+        )
     await callback.message.edit_text(text, reply_markup=get_cancel_keyboard(), parse_mode=ParseMode.MARKDOWN)
     await callback.answer()
 
@@ -898,21 +1417,37 @@ async def cb_done_select(callback: CallbackQuery):
         await callback.message.answer("Меню оновлено:", reply_markup=get_main_keyboard(has_queue=True))
         
         # Показуємо поточні графіки для обраних черг
-        ssl_context = get_ssl_context()
-        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        region = await get_user_region(callback.from_user.id)
+        sorted_queues = sorted(user_queues)
         
-        async with aiohttp.ClientSession(connector=connector) as session:
-            sorted_queues = sorted(user_queues)
-            for i, queue in enumerate(sorted_queues):
-                data = await fetch_schedule(session, queue)
-                if data:
-                    msg = format_notification(queue, data, is_update=False)
-                    # Додаємо кнопку донату до останнього повідомлення
-                    if i == len(sorted_queues) - 1:
+        if region == REGION_LVIV:
+            all_schedules = await asyncio.to_thread(_fetch_lviv_schedule_sync)
+            if all_schedules:
+                messages = []
+                for queue in sorted_queues:
+                    for date_str, day_data in all_schedules.items():
+                        slots = day_data.get(queue, [])
+                        messages.append((queue, slots, date_str))
+                for i, (queue, slots, date_str) in enumerate(messages):
+                    msg = format_lviv_notification(queue, slots, date_str=date_str)
+                    if i == len(messages) - 1:
                         await callback.message.answer(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=get_donate_keyboard())
                     else:
                         await callback.message.answer(msg, parse_mode=ParseMode.MARKDOWN)
-                await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.3)
+        else:
+            ssl_context = get_ssl_context()
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                for i, queue in enumerate(sorted_queues):
+                    data = await fetch_schedule(session, queue)
+                    if data:
+                        msg = format_notification(queue, data, is_update=False)
+                        if i == len(sorted_queues) - 1:
+                            await callback.message.answer(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=get_donate_keyboard())
+                        else:
+                            await callback.message.answer(msg, parse_mode=ParseMode.MARKDOWN)
+                    await asyncio.sleep(0.3)
     else:
         reminders_on = await get_user_reminders_state(callback.from_user.id)
         text = "⚠️ *Ви не обрали жодної черги*\n\nОберіть хоча б одну чергу для відслідковування."
@@ -1131,8 +1666,114 @@ def format_schedule_notification(queue_id: str, date: str, hours: list, change_t
     )
     return text
 
+
+async def lviv_scheduled_checker():
+    """Моніторинг графіків Львівської області (ЛОЕ)"""
+    logging.info("🚀 [ЛОЕ] Monitor started")
+    await asyncio.sleep(15)
+    
+    while True:
+        try:
+            all_schedules = await asyncio.to_thread(_fetch_lviv_schedule_sync)
+            if not all_schedules:
+                logging.warning("[ЛОЕ] No schedule data received")
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+            
+            today = datetime.now(KYIV_TZ).date()
+            
+            for queue_id in QUEUES:
+                state_key = f"lviv_{queue_id}"
+                
+                # Завантажуємо збережений стан
+                saved_state_json = await get_schedule_state(state_key)
+                saved_data = {}
+                if saved_state_json:
+                    try:
+                        saved_data = json.loads(saved_state_json)
+                    except:
+                        saved_data = {}
+                
+                # Очищення старих дат
+                cleaned_dates = []
+                for ds in list(saved_data.keys()):
+                    try:
+                        d, m, y = ds.split('.')
+                        if datetime(int(y), int(m), int(d)).date() < today:
+                            del saved_data[ds]
+                            cleaned_dates.append(ds)
+                    except Exception:
+                        pass
+                
+                if cleaned_dates:
+                    logging.info(f"[ЛОЕ] Cleaned old dates for {queue_id}: {cleaned_dates}")
+                    await save_schedule_state(state_key, json.dumps(saved_data))
+                
+                # Порівнюємо кожну дату
+                changes = []  # [(date_str, slots, "new"|"updated")]
+                
+                for date_str, day_data in all_schedules.items():
+                    # skip dates that are already in the past (avoid re-adding yesterday)
+                    try:
+                        d, m, y = date_str.split('.')
+                        date_obj = datetime(int(y), int(m), int(d)).date()
+                        if date_obj < today:
+                            continue
+                    except Exception:
+                        pass
+
+                    slots = day_data.get(queue_id)
+                    if slots is None:
+                        continue
+
+                    current_hash = json.dumps(slots, sort_keys=True)
+                    old_hash = saved_data.get(date_str)
+
+                    if old_hash is None:
+                        changes.append((date_str, slots, "new"))
+                        logging.info(f"[ЛОЕ] New schedule for {queue_id} on {date_str}")
+                    elif old_hash != current_hash:
+                        changes.append((date_str, slots, "updated"))
+                        logging.info(f"[ЛОЕ] Updated schedule for {queue_id} on {date_str}")
+
+                    saved_data[date_str] = current_hash
+                
+                if changes:
+                    subscribers = await get_users_by_queue(queue_id, REGION_LVIV)
+                    if subscribers:
+                        for user_id in subscribers:
+                            try:
+                                user_data = await get_user_data(user_id)
+                                address = user_data.get("address") if isinstance(user_data, dict) else None
+                                
+                                for i, (date_str, slots, change_type) in enumerate(changes):
+                                    msg = format_schedule_notification(queue_id, date_str, [
+                                        {"from": s, "to": e} for s, e in slots
+                                    ], change_type, address)
+                                    if i == len(changes) - 1:
+                                        await bot.send_message(user_id, msg, parse_mode=ParseMode.MARKDOWN, reply_markup=get_donate_keyboard())
+                                    else:
+                                        await bot.send_message(user_id, msg, parse_mode=ParseMode.MARKDOWN)
+                                    await asyncio.sleep(0.3)
+                                
+                                logging.info(f"[ЛОЕ] Notifications sent to {user_id} for {queue_id}")
+                            except Exception as e:
+                                logging.error(f"[ЛОЕ] Failed to send to {user_id}: {e}")
+                            await asyncio.sleep(0.5)
+                    
+                    await save_schedule_state(state_key, json.dumps(saved_data))
+                
+                await asyncio.sleep(0.5)
+            
+            logging.info(f"[ЛОЕ] Check completed. Next check in {CHECK_INTERVAL} seconds")
+        except Exception as e:
+            logging.error(f"[ЛОЕ] Checker error: {e}")
+        
+        await asyncio.sleep(CHECK_INTERVAL)
+
+
 async def scheduled_checker():
-    logging.info("🚀 Monitor started")
+    logging.info("🚀 [ІФ] Monitor started")
     await asyncio.sleep(10)
     
     while True:
@@ -1169,7 +1810,8 @@ async def scheduled_checker():
                     pass
             
             if old_dates:
-                logging.info(f"Cleaned old dates for {queue_id}: {old_dates}")
+                logging.info(f"[ІФ] Cleaned old dates for {queue_id}: {old_dates}")
+                await save_schedule_state(queue_id, json.dumps(saved_schedules))
             
             # Порівнюємо кожну дату окремо
             changes = []  # [(date, hours, "new"|"updated"), ...]
@@ -1180,18 +1822,18 @@ async def scheduled_checker():
                 if date not in saved_schedules:
                     # Нова дата - новий графік
                     changes.append((date, hours, "new"))
-                    logging.info(f"New schedule for {queue_id} on {date}")
+                    logging.info(f"[ІФ] New schedule for {queue_id} on {date}")
                 elif saved_schedules[date] != current_hash:
                     # Дата є, але графік змінився
                     changes.append((date, hours, "updated"))
-                    logging.info(f"Updated schedule for {queue_id} on {date}")
+                    logging.info(f"[ІФ] Updated schedule for {queue_id} on {date}")
                 
                 # Оновлюємо збережений стан
                 saved_schedules[date] = current_hash
             
             # Якщо є зміни - надсилаємо сповіщення
             if changes:
-                subscribers = await get_users_by_queue(queue_id)
+                subscribers = await get_users_by_queue(queue_id, REGION_IF)
                 
                 if subscribers:
                     for user_id in subscribers:
@@ -1220,7 +1862,7 @@ async def scheduled_checker():
             
             await asyncio.sleep(1)
         
-        logging.info(f"Check completed. Next check in {CHECK_INTERVAL} seconds")
+        logging.info(f"[ІФ] Check completed. Next check in {CHECK_INTERVAL} seconds")
         await asyncio.sleep(CHECK_INTERVAL)
 
 async def reminder_checker():
@@ -1237,17 +1879,25 @@ async def reminder_checker():
             if now.hour == 3 and now.minute < 2:
                 await cleanup_old_reminders()
             
-            # Завантажуємо графіки для ВСІХ черг один раз (кеш)
-            schedules_cache = {}
+            # Завантажуємо графіки для ВСІХ черг один раз (кеш) — ІФ
+            schedules_cache_if = {}
             for queue_id in QUEUES:
                 data = await fetch_schedule(None, queue_id)
                 if data:
                     schedule_data = data if isinstance(data, list) else data.get("schedule", [])
                     for record in schedule_data:
                         if record.get("eventDate") == today_str:
-                            schedules_cache[queue_id] = record.get("queues", {}).get(queue_id, [])
+                            schedules_cache_if[queue_id] = record.get("queues", {}).get(queue_id, [])
                             break
                 await asyncio.sleep(0.2)
+            
+            # Завантажуємо графіки Львів
+            schedules_cache_lviv = {}
+            lviv_data = await asyncio.to_thread(_fetch_lviv_schedule_sync)
+            if lviv_data:
+                lviv_today = lviv_data.get(today_str, {})
+                for queue_id, slots in lviv_today.items():
+                    schedules_cache_lviv[queue_id] = [{"from": s, "to": e} for s, e in slots]
             
             # Отримуємо всіх користувачів з підписками та увімкненими нагадуваннями
             cursor = db.users.find({"queues": {"$exists": True, "$ne": []},"reminders": True})
@@ -1257,6 +1907,7 @@ async def reminder_checker():
                 user_id = user["user_id"]
                 queues = user.get("queues", [])
                 user_intervals = user.get("reminder_intervals", DEFAULT_REMINDER_INTERVALS)
+                region = user.get("region", REGION_IF)
                 
                 # Пропускаємо якщо користувач не обрав жодного інтервалу
                 if not user_intervals:
@@ -1264,6 +1915,9 @@ async def reminder_checker():
                 
                 # Оновлюємо now для кожного користувача
                 now = datetime.now(KYIV_TZ)
+                
+                # Обираємо кеш відповідно до регіону
+                schedules_cache = schedules_cache_lviv if region == REGION_LVIV else schedules_cache_if
                 
                 for queue_id in queues:
                     queue_data = schedules_cache.get(queue_id, [])
@@ -1350,6 +2004,8 @@ def is_admin(user_id: int) -> bool:
 def get_admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📢 Розсилка всім", callback_data="admin_broadcast_all")],
+        [InlineKeyboardButton(text="🏔 Розсилка ІФ", callback_data="admin_broadcast_if"),
+         InlineKeyboardButton(text="🦁 Розсилка Львів", callback_data="admin_broadcast_lviv")],
         [InlineKeyboardButton(text="✉️ Надіслати одному", callback_data="admin_send_one")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
     ])
@@ -1379,23 +2035,40 @@ async def cb_admin_stats(callback: CallbackQuery):
     users_count = await db.users.count_documents({})
     active_count = await db.users.count_documents({"queues": {"$exists": True, "$ne": []}})
     reminders_on = await db.users.count_documents({"reminders": True})
+    if_count = await db.users.count_documents({"region": REGION_IF})
+    lviv_count = await db.users.count_documents({"region": REGION_LVIV})
     
     # Топ черг
     pipeline = [
         {"$unwind": "$queues"},
-        {"$group": {"_id": "$queues", "count": {"$sum": 1}}},
+        {"$group": {"_id": {"queue": "$queues", "region": "$region"}, "count": {"$sum": 1}}},
         {"$sort": {"count": -1}}
     ]
-    queue_stats = await db.users.aggregate(pipeline).to_list(length=20)
+    queue_stats = await db.users.aggregate(pipeline).to_list(length=40)
     
-    queue_lines = "\n".join([f"  `{q['_id']}` — {q['count']} підписників" for q in queue_stats]) or "  немає даних"
+    if_lines = []
+    lviv_lines = []
+    for q in queue_stats:
+        region = q["_id"].get("region", REGION_IF)
+        queue_id = q["_id"]["queue"]
+        if region == REGION_LVIV:
+            lviv_lines.append(f"  `{queue_id}` — {q['count']}")
+        else:
+            if_lines.append(f"  `{queue_id}` — {q['count']}")
+    
+    if_str = "\n".join(if_lines) or "  немає"
+    lviv_str = "\n".join(lviv_lines) or "  немає"
     
     text = (
         "📊 *Статистика бота*\n\n"
         f"👥 Всього користувачів: *{users_count}*\n"
         f"✅ Активних (з чергами): *{active_count}*\n"
         f"🔔 Нагадування увімкнено: *{reminders_on}*\n\n"
-        f"📋 *Підписки по чергах:*\n{queue_lines}"
+        f"🗺 *По регіонах:*\n"
+        f"  🏔 ІФ: *{if_count}*\n"
+        f"  🦁 Львів: *{lviv_count}*\n\n"
+        f"📋 *Черги (ІФ):*\n{if_str}\n\n"
+        f"📋 *Черги (Львів):*\n{lviv_str}"
     )
     
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -1440,6 +2113,46 @@ async def cb_admin_broadcast_all(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_cancel")]
     ]), parse_mode=ParseMode.MARKDOWN)
     await callback.answer()
+
+@dp.callback_query(F.data == "admin_broadcast_if")
+async def cb_admin_broadcast_if(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    
+    await state.set_state(AdminBroadcast.waiting_for_message)
+    await state.update_data(target="region", region=REGION_IF)
+    
+    count = await db.users.count_documents({"queues": {"$exists": True, "$ne": []}, "region": REGION_IF})
+    
+    text = (
+        f"🏔 *Розсилка ІФ ({count} користувачів)*\n\n"
+        "Надішліть повідомлення для розсилки."
+    )
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_cancel")]
+    ]), parse_mode=ParseMode.MARKDOWN)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_broadcast_lviv")
+async def cb_admin_broadcast_lviv(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    
+    await state.set_state(AdminBroadcast.waiting_for_message)
+    await state.update_data(target="region", region=REGION_LVIV)
+    
+    count = await db.users.count_documents({"queues": {"$exists": True, "$ne": []}, "region": REGION_LVIV})
+    
+    text = (
+        f"🦁 *Розсилка Львів ({count} користувачів)*\n\n"
+        "Надішліть повідомлення для розсилки."
+    )
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_cancel")]
+    ]), parse_mode=ParseMode.MARKDOWN)
+    await callback.answer()
+
 
 @dp.callback_query(F.data == "admin_send_one")
 async def cb_admin_send_one(callback: CallbackQuery, state: FSMContext):
@@ -1567,6 +2280,43 @@ async def admin_process_message(message: Message, state: FSMContext):
             parse_mode=ParseMode.MARKDOWN
         )
     
+    elif target == "region":
+        region = data.get("region", REGION_IF)
+        region_name = "🏔 ІФ" if region == REGION_IF else "🦁 Львів"
+        cursor = db.users.find({"queues": {"$exists": True, "$ne": []}, "region": region})
+        users = await cursor.to_list(length=None)
+        
+        progress_msg = await message.answer(f"📢 Розсилка {region_name}... 0/{len(users)}")
+        
+        for i, user in enumerate(users):
+            uid = user["user_id"]
+            try:
+                await forward_admin_message(message, uid)
+                success += 1
+            except Exception as e:
+                logging.error(f"Broadcast ({region}) failed for {uid}: {e}")
+                failed += 1
+            
+            await asyncio.sleep(0.05)
+            
+            if (i + 1) % 20 == 0:
+                try:
+                    await progress_msg.edit_text(f"📢 Розсилка {region_name}... {i+1}/{len(users)}")
+                except:
+                    pass
+        
+        try:
+            await progress_msg.delete()
+        except:
+            pass
+        
+        await message.answer(
+            f"✅ *Розсилка {region_name} завершена!*\n\n"
+            f"📤 Надіслано: *{success}*\n"
+            f"❌ Помилок: *{failed}*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
     elif target == "one":
         target_id = data.get("target_id")
         try:
@@ -1681,6 +2431,7 @@ async def start_web_server():
 async def main():
     logging.info("🤖 Bot starting...")
     logging.info(f"📋 Config: APQE_PQFRTY={'SET' if APQE_PQFRTY else 'NOT SET'}, APSRC_PFRTY={'SET' if APSRC_PFRTY else 'NOT SET'}")
+    logging.info(f"📋 Config: APQE_LOE={'SET' if LVIV_API_URL else 'NOT SET'}, APWR_LOE={'SET' if LVIV_POWER_API_URL else 'NOT SET'}")
     logging.info(f"📋 MongoDB: {MONGO_URI[:20]}...")
     await init_db()
     
@@ -1688,8 +2439,11 @@ async def main():
         # Запускаємо веб-сервер
         await start_web_server()
         
-        # Запускаємо моніторинг графіків
+        # Запускаємо моніторинг графіків (ІФ)
         asyncio.create_task(scheduled_checker())
+        
+        # Запускаємо моніторинг графіків (Львів)
+        asyncio.create_task(lviv_scheduled_checker())
         
         # Запускаємо нагадування
         asyncio.create_task(reminder_checker())

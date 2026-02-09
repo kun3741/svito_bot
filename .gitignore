@@ -31,3 +31,7 @@ Thumbs.db
 # Old data files (migrated to MongoDB)
 schedule_state.json
 users_data.json
+lviv_api/
+lviv_api/users.json
+
+migrate_region.py
